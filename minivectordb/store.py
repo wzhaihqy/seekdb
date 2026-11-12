@@ -549,13 +549,18 @@ class ColumnarStore:
     # larger than the memory budget searchable.
 
     def _mapped(self, key: tuple, path: str, dtype: str, elements: int,
-                per_slot: int = 1) -> Any:
-        """A cached numpy view of a column file."""
+                per_slot: int = 1, size: int | None = None) -> Any:
+        """A cached numpy view of a column file.
 
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            return None
+        The size is taken from the arena when the caller knows it, so the
+        cache does not have to ask the file system on every query.
+        """
+
+        if size is None:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                return None
         entry = self._numpy_cache.get(key)
         if entry is not None and entry[0] == size:
             return entry[1]
@@ -579,13 +584,13 @@ class ColumnarStore:
         count = self.slot_count
         if column.type == BIGINT:
             return self._mapped(("col", position), self._arena[position].path,
-                                "<i8", count)
+                                "<i8", count, 1, self._arena[position].size)
         if column.type == VECTOR:
             dim = column.dim or 0
             if dim <= 0:
                 return None
             return self._mapped(("col", position), self._arena[position].path,
-                                "<f4", count, dim)
+                                "<f4", count, dim, self._arena[position].size)
         return None
 
     def vector_matrix64(self, position: int) -> Any:
@@ -660,7 +665,7 @@ class ColumnarStore:
         if not fastpath.available():
             return None
         flags = self._mapped(("null", position), self._nulls[position].path,
-                             "u1", self.slot_count)
+                             "u1", self.slot_count, 1, self._nulls[position].size)
         if flags is None:
             return None
         return flags.astype(bool)
@@ -670,7 +675,8 @@ class ColumnarStore:
 
         if not fastpath.available():
             return None
-        flags = self._mapped(("live",), self._live.path, "u1", self.slot_count)
+        flags = self._mapped(("live",), self._live.path, "u1", self.slot_count,
+                             1, self._live.size)
         if flags is None:
             return None
         return flags.astype(bool)
@@ -680,7 +686,8 @@ class ColumnarStore:
 
         if not fastpath.available():
             return None
-        return self._mapped(("pk",), self._pk.path, "<i8", self.slot_count)
+        return self._mapped(("pk",), self._pk.path, "<i8", self.slot_count,
+                             1, self._pk.size)
 
     def varchar_column_bytes(self, position: int, start: int = 0,
                              end: int | None = None) -> tuple[Any, Any, Any]:
