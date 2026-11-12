@@ -169,7 +169,7 @@ def select_topk(distances: Any, pks: Any, limit: int) -> Any:
         # reference distances are equal can end up a few ulp apart in the
         # vectorised result.  The rows that survive are ordered by the
         # reference distance again before the answer is returned.
-        tolerance = max(1e-9, abs(float(boundary)) * 1e-9)
+        tolerance = max(1e-6, abs(float(boundary)) * 1e-9)
         candidates = _np.flatnonzero(distances <= boundary + tolerance)
     else:
         candidates = _np.arange(total, dtype=_np.int64)

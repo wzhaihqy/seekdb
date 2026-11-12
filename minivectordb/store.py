@@ -624,6 +624,36 @@ class ColumnarStore:
         self._numpy_cache[key] = (size, converted)
         return converted
 
+    def vector_norms64(self, position: int) -> Any:
+        """The squared norm of every row of a vector column, in float64.
+
+        The scan can turn the distances into one matrix product when the
+        squared norm of every row is known: `|a-q|^2 = |a|^2 - 2 a.q + |q|^2`.
+        The result differs from the reference distance by a few ulp, and by
+        about 1e-7 when the query is identical to a row and the two terms
+        cancel; the candidate selection keeps a tolerance that covers it, and
+        the rows that are reported are recomputed with the reference
+        implementation.
+        """
+
+        if not fastpath.available():
+            return None
+        matrix = self.vector_matrix64(position)
+        if matrix is None:
+            return None
+        try:
+            size = self._arena[position].size
+        except OSError:
+            return None
+        key = ("norm64", position)
+        entry = self._numpy_cache.get(key)
+        if entry is not None and entry[0] == size:
+            return entry[1]
+        numpy = fastpath.module()
+        norms = numpy.einsum("ij,ij->i", matrix, matrix)
+        self._numpy_cache[key] = (size, norms)
+        return norms
+
     def null_mask(self, position: int) -> Any:
         """A boolean array that is ``True`` where the slot holds NULL."""
 
@@ -766,9 +796,14 @@ class ColumnarStore:
             if slot >= cached.shape[0]:
                 raise IndexError(slot)
             values = numpy.frombuffer(payload, dtype=numpy.float32)
-            cached[slot, :] = values.astype(numpy.float64)
+            widened = values.astype(numpy.float64)
+            cached[slot, :] = widened
+            norms = self._numpy_cache.get(("norm64", position))
+            if norms is not None:
+                norms[1][slot] = float(numpy.dot(widened, widened))
         except (IndexError, TypeError, ValueError):
             self._numpy_cache.pop(("col64", position), None)
+            self._numpy_cache.pop(("norm64", position), None)
 
     # -- durability --------------------------------------------------------
     def flush(self) -> None:

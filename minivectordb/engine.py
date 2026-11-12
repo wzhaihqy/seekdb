@@ -930,6 +930,12 @@ class Engine:
         query_array = numpy.frombuffer(memoryview(query), dtype=numpy.float32)
         dim = table.columns[column_position].dim or 0
         scratch = self._scan_buffer(dim)
+        norms = store.vector_norms64(column_position)
+        if norms is not None:
+            query64 = query_array.astype(numpy.float64)
+            query_norm = float(numpy.dot(query64, query64))
+        else:
+            query64 = None
         candidates: list[tuple[float, int, int]] = []
         for start in range(0, total, self.SCAN_CHUNK):
             end = min(start + self.SCAN_CHUNK, total)
@@ -944,21 +950,37 @@ class Engine:
             else:
                 block = matrix32[start:end].astype(numpy.float64)
             block_pks = pks[start:end]
-            if bool(keep.all()):
-                rows = block
-                slots = numpy.arange(start, end, dtype=numpy.int64)
+            if matrix64 is not None and norms is not None:
+                # |a-q|^2 = |a|^2 - 2 a.q + |q|^2: one matrix product per
+                # block instead of a difference buffer and a second pass.
+                squared = norms[start:end] - 2.0 * (block @ query64) + query_norm
+                numpy.maximum(squared, 0.0, out=squared)
+                distances = numpy.sqrt(squared)
+                if not bool(keep.all()):
+                    selected = numpy.flatnonzero(keep)
+                    if selected.size == 0:
+                        continue
+                    distances = distances[selected]
+                    block_pks = block_pks[selected]
+                    slots = selected + start
+                else:
+                    slots = numpy.arange(start, end, dtype=numpy.int64)
             else:
-                selected = numpy.flatnonzero(keep)
-                if selected.size == 0:
-                    continue
-                rows = block[selected]
-                block_pks = block_pks[selected]
-                slots = selected + start
-            if matrix64 is not None:
-                distances = fastpath.l2_distances_into(rows, query_array,
-                                                      scratch[:rows.shape[0]])
-            else:
-                distances = fastpath.l2_distances(rows, query_array)
+                if bool(keep.all()):
+                    rows = block
+                    slots = numpy.arange(start, end, dtype=numpy.int64)
+                else:
+                    selected = numpy.flatnonzero(keep)
+                    if selected.size == 0:
+                        continue
+                    rows = block[selected]
+                    block_pks = block_pks[selected]
+                    slots = selected + start
+                if matrix64 is not None:
+                    distances = fastpath.l2_distances_into(rows, query_array,
+                                                          scratch[:rows.shape[0]])
+                else:
+                    distances = fastpath.l2_distances(rows, query_array)
             for index in fastpath.select_topk(distances, block_pks, limit):
                 candidates.append((float(distances[index]), int(block_pks[index]),
                                    int(slots[index])))
@@ -968,10 +990,12 @@ class Engine:
         # The per chunk candidates already contain the rows that can reach the
         # global top k.  The rows that tie with the boundary distance are kept
         # as well, so the reference distances can decide the order the same
-        # way a pure-Python scan would.
+        # way a pure-Python scan would.  The tolerance also covers the rows
+        # that the norm formula puts a little off, because the two terms
+        # cancel when the query is identical to a row.
         candidates.sort(key=lambda item: (item[0], item[1]))
         boundary = candidates[min(limit, len(candidates)) - 1][0]
-        tolerance = max(1e-9, abs(boundary) * 1e-9)
+        tolerance = max(1e-6, abs(boundary) * 1e-9)
         return [item for item in candidates if item[0] <= boundary + tolerance]
 
     def _scan_buffer(self, dim: int):
