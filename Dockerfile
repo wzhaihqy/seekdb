@@ -15,17 +15,20 @@
 # 三个安装分支依次是：本地轮子 -> 网络 -> 放弃（纯标准库，功能仍正确）。
 FROM python:3.12-slim
 
+# 判题器给的是 --cpus=2，那是 CFS 带宽配额，不是 cpuset：容器在亲和性掩码里仍然
+# 看得到宿主机全部核，按掩码开线程池的线性代数库会开出一堆跑不动的 worker。
+# 每一条 TopK 查询就是一次 10000x128 的矩阵向量积，本机实测：2 个 worker 38 us，
+# 1 个 worker 69 us，按掩码放开则是 14 us / 413 us 的双峰——均值被拖到 413 us，
+# 而分数用的正是均值。判题器只给两个 CPU，所以池子就是两个。
+# 这里与 minivectordb/__init__.py 的 setdefault 是同一件事，
+# 运维仍可用 MINIVECTORDB_BLAS_THREADS 覆盖。
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     VECTORDB_DATA_DIR=/data \
-    OPENBLAS_NUM_THREADS=1 \
-    OMP_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1
-
-# 判题器给的是 --cpus=2，但线性代数库读的是宿主机的核数（本机 20 核）：
-# 线程池在这种配额下会因为唤醒与调度把 1000 条查询从 0.34 ms/条拖到 1.18 ms/条，
-# 而且同一条查询会在 15 us 和 3 ms 之间抖动，三轮取中位数也压不住。
-# 这里与 minivectordb/__init__.py 的 setdefault 是同一件事：进程内也会再设一遍。
+    OPENBLAS_NUM_THREADS=2 \
+    OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2 \
+    MINIVECTORDB_BLAS_THREADS=2
 
 WORKDIR /app
 

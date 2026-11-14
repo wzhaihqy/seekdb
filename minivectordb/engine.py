@@ -114,6 +114,11 @@ class Engine:
         # single entry would be rebuilt on every filtered query; the entries
         # are kept per clause and dropped the moment the store is written.
         self._filter_cache: tuple | None = None
+        # The one float32 row of the coarse scan (one entry per slot of the
+        # scanned column).  Allocated on the first query and then reused:
+        # every query writes it, reads it once per pass and never keeps it.
+        self._distance_buffer = None
+        self._scan_width = 0
 
     # ------------------------------------------------------------- lifecycle
     def open(self) -> None:
@@ -1204,8 +1209,7 @@ class Engine:
         distances = self._distances(numpy, matrix, norms, query32, qnorm)
         return self._select(numpy, distances[ids], pks, ids, take)
 
-    @staticmethod
-    def _distances(numpy: Any, rows: Any, row_norms: Any, query32: Any,
+    def _distances(self, numpy: Any, rows: Any, row_norms: Any, query32: Any,
                    qnorm: float) -> Any:
         """``|a-q|^2`` for every row, from the row norms and one product.
 
@@ -1222,7 +1226,28 @@ class Engine:
         # three temporary arrays of one float per row are three allocations
         # the query cannot afford.  Adding ``-2 * a.q`` gives the same bits as
         # subtracting ``2 * a.q``, so the values do not change.
-        squared = rows @ query32
+        #
+        # The product lands in a buffer the engine keeps between queries: a
+        # forty kilobyte allocation per query is a malloc, a fault in a fresh
+        # page and a free, and the array is read once and thrown away.
+        # ``dot`` with an ``out`` runs the same kernel as ``@``.  Nothing
+        # keeps the array past the call -- the selection copies the rows it
+        # returns -- and the protocol is one request at a time, so the buffer
+        # cannot be overwritten while someone is reading it.
+        #
+        # It is sized to the widest scan and then sliced: a query with a
+        # filter scans the few hundred rows it selects, the next one without a
+        # filter scans the whole column, and a buffer that followed the last
+        # query would be reallocated on every alternation.
+        count = rows.shape[0]
+        buffer = self._distance_buffer
+        if buffer is None or buffer.shape[0] < count:
+            buffer = numpy.empty(max(count, self._scan_width),
+                                 dtype=numpy.float32)
+            self._distance_buffer = buffer
+            self._scan_width = buffer.shape[0]
+        squared = buffer[:count]
+        numpy.dot(rows, query32, out=squared)
         numpy.multiply(squared, -2.0, out=squared)
         squared += row_norms
         squared += qnorm
