@@ -845,6 +845,24 @@ class ColumnarStore:
         self._numpy_cache[key] = (self._version, converted)
         return converted
 
+    def all_live(self) -> bool:
+        """Whether every slot holds a live row.
+
+        The scan asks the live mask whether it can skip the deleted rows, and
+        reducing ten thousand flags costs a pass over the mask on every query.
+        The answer only changes on a write, so it is remembered for the write
+        generation it was derived from, next to the mask itself.
+        """
+
+        key = ("alllive",)
+        entry = self._numpy_cache.get(key)
+        if entry is not None and entry[0] == self._version:
+            return entry[1]
+        mask = self.live_mask()
+        value = True if mask is None else bool(mask.all())
+        self._numpy_cache[key] = (self._version, value)
+        return value
+
     def primary_keys(self) -> Any:
         """The primary key of every slot as an ``int64`` array."""
 

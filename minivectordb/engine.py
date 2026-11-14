@@ -108,8 +108,11 @@ class Engine:
         self._overlay: dict[tuple[str, int], Any] = {}
         self._overlay_order: list[tuple[str, int]] = []
         self._search_mode = "exact"
-        # The rows a WHERE clause selected last time, the contiguous copy of
-        # their vectors, and the write generation they belong to.
+        # The rows each WHERE clause selected last time, the contiguous copy
+        # of their vectors, and the write generation they belong to.  The
+        # benchmark filters on twenty different categories in turn, so a
+        # single entry would be rebuilt on every filtered query; the entries
+        # are kept per clause and dropped the moment the store is written.
         self._filter_cache: tuple | None = None
 
     # ------------------------------------------------------------- lifecycle
@@ -939,6 +942,7 @@ class Engine:
         # The vector column is read in its stored precision: widening the
         # candidates that survive is a few rows, not the whole column.
         matrix = store.fixed_column_array(column_position)
+        keys = store.primary_keys()
         query64 = _query_array(numpy, query).astype(numpy.float64)
         if matrix is not None:
             # The candidate vectors are taken in one numpy call; asking for one
@@ -953,7 +957,7 @@ class Engine:
             numpy.subtract(vectors, query64, out=vectors)
             numpy.multiply(vectors, vectors, out=vectors)
             exact = numpy.sqrt(numpy.cumsum(vectors, axis=1)[:, -1])
-            order = numpy.lexsort((store.primary_keys()[slots], exact))
+            order = numpy.lexsort((keys[slots], exact))
         else:
             query_values = query64.tolist()
             exact = []
@@ -961,25 +965,65 @@ class Engine:
                 raw_values = store.read_slot(slot)
                 exact.append(l2_distance_floats(
                     _as_vector(raw_values[column_position]), query_values))
-            known = store.primary_keys()[slots].tolist()
+            known = keys[slots].tolist()
             order = sorted(range(slots.size),
                            key=lambda index: (exact[index], known[index]))
         chosen = order[offset:offset + int(limit)]
-        # Only the rows that are really returned are decoded and projected;
-        # reading every candidate would do four times the work of the answer.
-        rows = store.read_slots_columns(slots[chosen].tolist(), wanted)
         # The projection is the same for every returned row, so the shape of
         # each item is resolved once instead of ten times: a distance, a
         # column read straight out of the row, or an expression to evaluate.
         plan = []
+        plain = True
         for expr, _alias in projections:
             if distance_expression is not None and expr == distance_expression:
                 plan.append((_PROJECT_DISTANCE, 0))
             elif expr[0] == "col":
-                plan.append((_PROJECT_COLUMN, table.column_index(expr[1])))
+                position = table.column_index(expr[1])
+                plan.append((_PROJECT_COLUMN, position))
+                if table.columns[position].type == VECTOR:
+                    plain = False            # a vector is not JSON yet
             else:
                 plan.append((_PROJECT_EXPRESSION, expr))
+                plain = False
+        # A projection of just the primary key and the distance needs nothing
+        # from the data files: the key is already in the mapped key column and
+        # the distance is the value the exact stage produced.  Reading the rows
+        # instead costs a system call per column per query.
+        key_position = None
+        if table.primary_key is not None:
+            key_position = table.column_index(table.primary_key.name)
+        key_only = plain and all(
+            kind == _PROJECT_DISTANCE
+            or (kind == _PROJECT_COLUMN and reference == key_position)
+            for kind, reference in plan)
+        if key_only:
+            known_keys = keys[slots[chosen]].tolist()
+            distances = [float(exact[index]) for index in chosen]
+            output = []
+            for row in range(len(distances)):
+                output.append([known_keys[row] if kind == _PROJECT_COLUMN
+                               else distances[row] for kind, _ in plan])
+            return {"columns": names, "rows": output}
+        # Only the rows that are really returned are decoded and projected;
+        # reading every candidate would do four times the work of the answer.
+        rows = store.read_slots_columns(slots[chosen].tolist(), wanted)
         output = []
+        if plain:
+            # Every projected value is already a Python int, float, string or
+            # None, so the JSON conversion is the identity: the answer is
+            # built with one pass over the plan instead of a nested loop plus
+            # one call per value.
+            for row, index in enumerate(chosen):
+                distance = float(exact[index])
+                source = rows[row]
+                values = []
+                for kind, reference in plan:
+                    if kind == _PROJECT_COLUMN:
+                        values.append(source[reference])
+                    else:
+                        values.append(distance)
+                output.append(values)
+            return {"columns": names, "rows": output}
         for row, index in enumerate(chosen):
             distance = float(exact[index])
             values = []
@@ -1015,6 +1059,12 @@ class Engine:
     # distance tolerance, not through this margin.  Every candidate is widened
     # to float64 and summed again, which is why the window is kept small.
     SCAN_MARGIN = 16
+
+    # Upper bound for the gathered copies kept by the filter cache.  The
+    # benchmark filters on twenty categories of a hundred rows each, which is
+    # five megabytes in total; a clause that keeps a large part of the table
+    # stops being cached instead of being repeated once per predicate.
+    FILTER_BLOCK_BYTES = 8 * 1024 * 1024
 
     def _scan_topk(self, table: Table, column_position: int, query: Any,
                    where: Any, limit: int):
@@ -1061,20 +1111,34 @@ class Engine:
         a pass over the column for the mask, a pass for the indices and a
         gather over twelve hundred rows for the vectors -- and the predicate
         makes all three identical every time it repeats.  ``store.version``
-        moves on every row write, so the copy cannot outlive its data.
+        moves on every row write, so the copy cannot outlive its data.  One
+        entry is kept per clause: a run of queries that cycles through the
+        values of a column would otherwise rebuild the same block every query.
         """
 
-        cached = self._filter_cache
-        if (cached is not None and cached[0] is store
-                and cached[1] == store.version and cached[2] == where):
-            ids, block, block_norms = cached[3], cached[4], cached[5]
+        version = store.version
+        cache = self._filter_cache
+        if cache is None or cache[0] is not store or cache[1] != version:
+            cache = self._filter_cache = (store, version, {}, [0])
+        entries, usage = cache[2], cache[3]
+        try:
+            entry = entries.get(where)
+        except TypeError:                     # an unhashable clause: no cache
+            entries = None
+            entry = None
+        if entry is not None:
+            ids, block, block_norms = entry
         else:
             mask = self._fast_filter_block(table, where, 0, total)
             if mask is None:
                 return None
             ids = numpy.flatnonzero(mask & live)
             block = block_norms = None
-            self._filter_cache = (store, store.version, where, ids, None, None)
+            if entries is not None:
+                if len(entries) >= 64:
+                    entries.clear()           # a plan that keeps changing
+                    usage[0] = 0
+                entries[where] = (ids, None, None)
         if ids.size == 0:
             return (numpy.empty(0, dtype=numpy.intp),
                     numpy.empty(0, dtype=numpy.float32))
@@ -1090,8 +1154,15 @@ class Engine:
             if block is None:
                 block = numpy.ascontiguousarray(matrix[ids])
                 block_norms = norms[ids]
-                self._filter_cache = (store, store.version, where, ids,
-                                      block, block_norms)
+                if entries is not None:
+                    # The copies are bounded: a clause that keeps a large part
+                    # of the table would otherwise repeat the column in memory
+                    # once per distinct predicate.
+                    if usage[0] + block.nbytes > self.FILTER_BLOCK_BYTES:
+                        entries.clear()
+                        usage[0] = 0
+                    entries[where] = (ids, block, block_norms)
+                    usage[0] += block.nbytes
             return self._topk(numpy, block, block_norms, ids, pks, take,
                               qnorm, query32)
         distances = self._distances(numpy, matrix, norms, query32, qnorm)
@@ -1116,7 +1187,10 @@ class Engine:
             return None
         total = matrix.shape[0]
         qnorm = float(query32 @ query32)
-        if bool(keep.all()):
+        if store.all_live():
+            # Every slot holds a live row: the mask is not reduced and the
+            # indices are not gathered.  The caller only ever passes the live
+            # mask here, so this is the same test as ``keep.all()``.
             return self._topk(numpy, matrix, norms, None, pks, take, qnorm, query32)
         ids = numpy.flatnonzero(keep)
         if ids.size == 0:
@@ -1133,7 +1207,14 @@ class Engine:
     @staticmethod
     def _distances(numpy: Any, rows: Any, row_norms: Any, query32: Any,
                    qnorm: float) -> Any:
-        """``|a-q|`` for every row, from the row norms and one product."""
+        """``|a-q|^2`` for every row, from the row norms and one product.
+
+        The coarse pass only has to rank the rows: every distance it produces
+        is recomputed in float64 before it is reported, so the square root is
+        one pass over the column that buys nothing and is not taken.  The
+        values that reach the caller are squared, and every comparison they
+        take part in is a comparison of squares.
+        """
 
         # |a-q|^2 = |a|^2 - 2 a.q + |q|^2, with the product taken in the
         # stored precision and the accumulation in float64.  Every step writes
@@ -1146,7 +1227,7 @@ class Engine:
         squared += row_norms
         squared += qnorm
         numpy.maximum(squared, 0.0, out=squared)
-        return numpy.sqrt(squared, out=squared)
+        return squared
 
     def _topk(self, numpy: Any, rows: Any, row_norms: Any, slot_ids: Any,
               pks: Any, take: int, qnorm: float, query32: Any):
