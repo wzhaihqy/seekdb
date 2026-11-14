@@ -80,3 +80,8 @@ ANN 召回与去重。
 - `CREATE VECTOR INDEX` 语句可用，但 ANN 路径目前走精确扫描（召回率 1.0，满足门槛，性能分因此偏低）。
 - 嵌套事务、聚合、JOIN、子查询、ALTER、外键、NULL 值、主键更新按题面要求返回 `unsupported_sql`。
 - 容器构建期若无法联网安装 numpy，会自动退回纯标准库路径：**功能与正确性不受影响**，只是 TopK 查询慢约 30 倍。
+
+## Agent Prompt 学习材料
+
+- 材料正文：AGENT_PROMPT.md（摘要 / 学习规划 / Prompt 迭代 / 验证纠错 / 总结复盘 五部分）
+- 原始对话与实验记录：conversation.json（同内容副本 agent/conversation.json）
