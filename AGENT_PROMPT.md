@@ -105,6 +105,6 @@ Prompt：`站在出题人角度，列出公开用例没覆盖什么，再逐条�
 | 程序入口 | `main.py` |
 | 协议说明 | `STDIO_PROTOCOL.md` |
 | 设计说明 | `DESIGN.md` |
-| 原始对话与实验记录 | `conversation.json`（含 19 条 user prompt、12 段对话、29 个实验） |
+| 原始对话与实验记录 | `agent/conversation.json`（含 25 条 user prompt、17 段对话、42 个实验、5 个维度 15 个可校验实例；每条证据为 RFC6901 指针 + ≤240 字符逐字引文） |
 | 自测与对拍工具 | `tools/mvdb_*.py` |
 | 官方公开用例 | `mysqltest/`、`protocol_check/` |
