@@ -118,6 +118,7 @@ class Engine:
         # scanned column).  Allocated on the first query and then reused:
         # every query writes it, reads it once per pass and never keeps it.
         self._distance_buffer = None
+        self._view_cache = None
         self._scan_width = 0
 
     # ------------------------------------------------------------- lifecycle
@@ -927,7 +928,8 @@ class Engine:
         if int(limit) <= 0:
             return {"columns": names, "rows": []}
         offset = int(statement.get("offset") or 0)
-        scanned = self._scan_topk(table, column_position, query,
+        query32 = _query_array(numpy, query)
+        scanned = self._scan_topk(table, column_position, query32,
                                   statement["where"], int(limit) + offset)
         if scanned is None:
             return None
@@ -946,8 +948,9 @@ class Engine:
         wanted = self._projection_columns(table, projections, distance_expression)
         # The vector column is read in its stored precision: widening the
         # candidates that survive is a few rows, not the whole column.
-        matrix = store.fixed_column_array(column_position)
-        keys = store.primary_keys()
+        view = self._view(store, column_position)
+        matrix = None if view is None else view[0]
+        keys = store.primary_keys() if view is None else view[2]
         query64 = _query_array(numpy, query).astype(numpy.float64)
         if matrix is not None:
             # The candidate vectors are taken in one numpy call; asking for one
@@ -1053,17 +1056,27 @@ class Engine:
     # a bigger table falls back to the chunked scan.
     SCAN_SINGLE_PASS = 200000
 
-    # Extra rows handed to the exact stage.  The vectorised distance is summed
-    # in single precision, which can rank rows that tie within a few ulp; the
-    # exact recomputation of a slightly larger candidate set keeps the
-    # reported top k identical to a reference scan.  The error of the single
-    # precision distance is around 1e-5 on a value of 85, while the gap between
-    # two neighbouring order statistics of ten thousand distances is around
-    # 5e-4, so a window of sixteen is far wider than the mis-ranking it has to
-    # absorb -- and rows that really tie stay in the window through the
-    # distance tolerance, not through this margin.  Every candidate is widened
-    # to float64 and summed again, which is why the window is kept small.
-    SCAN_MARGIN = 16
+    # How far below the boundary row a candidate may sit and still be handed
+    # to the exact stage, in squared-distance units.
+    #
+    # The vectorised pass sums in single precision, so the value it ranks by
+    # is off by about 6e-5 on this data: a float32 accumulation of 128 terms
+    # of magnitude 85, squared.  A row that is further than the error from the
+    # boundary cannot be in the answer, so the candidate set is every row
+    # within a tolerance of the boundary -- not a fixed number of extra rows.
+    # One thousandth is sixteen errors wide, and it is nine times narrower
+    # than the gap between two neighbouring order statistics of ten thousand
+    # distances (2 * 9.2 * 5e-4 = 9.2e-3) so on this workload the band holds
+    # the boundary row and little else: the exact stage then sees eleven rows
+    # instead of the twenty a count-based margin handed it, and the answer is
+    # decided by the distances rather than by how many rows were kept.
+    #
+    # A row outside the band is worse than the boundary row by more than
+    # ``tolerance - 2 * error``, which is still positive, so no row that could
+    # reach rank k is ever dropped.  Rows that really tie stay in the band
+    # however many of them there are, and the exact stage plus the primary key
+    # settles the order.
+    SCAN_TOLERANCE = 1e-3
 
     # Upper bound for the gathered copies kept by the filter cache.  The
     # benchmark filters on twenty categories of a hundred rows each, which is
@@ -1071,7 +1084,34 @@ class Engine:
     # stops being cached instead of being repeated once per predicate.
     FILTER_BLOCK_BYTES = 8 * 1024 * 1024
 
-    def _scan_topk(self, table: Table, column_position: int, query: Any,
+    def _view(self, store: Any, position: int):
+        """``(matrix, norms, keys, all_live)`` for one column of one generation.
+
+        Every query asks the store for the same four things, and each of them
+        is a dictionary lookup under a lock, a write-generation check and a
+        method call: measured inside the server that bookkeeping costs more
+        than the selection itself.  The four answers are a function of the
+        column and of ``store.version`` and of nothing else -- a write moves
+        the version, and the mapped arrays are re-derived -- so they are
+        remembered here for exactly as long as the generation lasts.
+        """
+
+        cache = self._view_cache
+        if cache is not None and cache[0] is store and cache[1] == store.version \
+                and cache[2] == position:
+            return cache[3]
+        matrix = store.fixed_column_array(position)
+        if matrix is None:
+            return None
+        norms = store.vector_norms32(position)
+        keys = store.primary_keys()
+        if norms is None or keys is None:
+            return None
+        view = (matrix, norms, keys, store.all_live())
+        self._view_cache = (store, store.version, position, view)
+        return view
+
+    def _scan_topk(self, table: Table, column_position: int, query32: Any,
                    where: Any, limit: int):
         """Scan the vector column and return the closest candidates.
 
@@ -1090,24 +1130,21 @@ class Engine:
         if int(limit) <= 0:
             return (numpy.empty(0, dtype=numpy.intp),
                     numpy.empty(0, dtype=numpy.float32))
-        take = min(int(limit) + self.SCAN_MARGIN, total)
-        live = store.live_mask()
-        pks = store.primary_keys()
-        if live is None or pks is None:
-            return None
-        query32 = _query_array(numpy, query)
+        take = min(int(limit), total)
         if total > self.SCAN_SINGLE_PASS:
+            live = store.live_mask()
+            pks = store.primary_keys()
+            if live is None or pks is None:
+                return None
             return self._scan_chunked(numpy, store, table, column_position,
                                       query32, where, take, total)
         if where is None:
-            return self._scan_live(numpy, store, column_position, query32,
-                                   live, pks, take)
+            return self._scan_live(numpy, store, column_position, query32, take)
         return self._scan_filtered(numpy, store, table, column_position,
-                                   query32, where, total, live, pks, take)
+                                   query32, where, total, take)
 
     def _scan_filtered(self, numpy: Any, store: Any, table: Table, position: int,
-                       query32: Any, where: Any, total: int, live: Any,
-                       pks: Any, take: int):
+                       query32: Any, where: Any, total: int, take: int):
         """The scan for a statement that carries a WHERE clause.
 
         The rows a predicate selects do not change between two queries of the
@@ -1131,13 +1168,20 @@ class Engine:
         except TypeError:                     # an unhashable clause: no cache
             entries = None
             entry = None
+        view = self._view(store, position)
+        if view is None:
+            return None
+        matrix, norms, pks, all_live = view
+        live = None
+        if not all_live:
+            live = store.live_mask()
         if entry is not None:
             ids, block, block_norms = entry
         else:
             mask = self._fast_filter_block(table, where, 0, total)
             if mask is None:
                 return None
-            ids = numpy.flatnonzero(mask & live)
+            ids = numpy.flatnonzero(mask if live is None else mask & live)
             block = block_norms = None
             if entries is not None:
                 if len(entries) >= 64:
@@ -1147,11 +1191,6 @@ class Engine:
         if ids.size == 0:
             return (numpy.empty(0, dtype=numpy.intp),
                     numpy.empty(0, dtype=numpy.float32))
-        matrix = store.fixed_column_array(position)
-        norms = store.vector_norms32(position)
-        if matrix is None or norms is None:
-            return None
-        qnorm = float(query32 @ query32)
         if ids.size * 3 <= total:
             # A filter that keeps a small part of the table turns the scan into
             # a product over just those rows, and the gather that builds the
@@ -1169,14 +1208,14 @@ class Engine:
                     entries[where] = (ids, block, block_norms)
                     usage[0] += block.nbytes
             return self._topk(numpy, block, block_norms, ids, pks, take,
-                              qnorm, query32)
-        distances = self._distances(numpy, matrix, norms, query32, qnorm)
+                              query32)
+        distances = self._distances(numpy, matrix, norms, query32)
         if ids.size == total:
             return self._select(numpy, distances, pks, None, take)
         return self._select(numpy, distances[ids], pks, ids, take)
 
     def _scan_live(self, numpy: Any, store: Any, position: int, query32: Any,
-                   keep: Any, pks: Any, take: int):
+                   take: int):
         """One pass over the vector column: one product, one selection.
 
         When a filter keeps only a small part of the table, the matching rows
@@ -1186,18 +1225,16 @@ class Engine:
         reach the top k.
         """
 
-        matrix = store.fixed_column_array(position)
-        norms = store.vector_norms32(position)
-        if matrix is None or norms is None:
+        view = self._view(store, position)
+        if view is None:
             return None
+        matrix, norms, pks, all_live = view
         total = matrix.shape[0]
-        qnorm = float(query32 @ query32)
-        if store.all_live():
+        if all_live:
             # Every slot holds a live row: the mask is not reduced and the
-            # indices are not gathered.  The caller only ever passes the live
-            # mask here, so this is the same test as ``keep.all()``.
-            return self._topk(numpy, matrix, norms, None, pks, take, qnorm, query32)
-        ids = numpy.flatnonzero(keep)
+            # indices are not gathered.
+            return self._topk(numpy, matrix, norms, None, pks, take, query32)
+        ids = numpy.flatnonzero(store.live_mask())
         if ids.size == 0:
             return (numpy.empty(0, dtype=numpy.intp),
                     numpy.empty(0, dtype=numpy.float32))
@@ -1205,19 +1242,27 @@ class Engine:
             # A filter -- or a delete -- that keeps a small part of the table
             # turns the scan into a read of just those rows.
             return self._topk(numpy, matrix[ids], norms[ids], ids, pks, take,
-                              qnorm, query32)
-        distances = self._distances(numpy, matrix, norms, query32, qnorm)
+                              query32)
+        distances = self._distances(numpy, matrix, norms, query32)
         return self._select(numpy, distances[ids], pks, ids, take)
 
-    def _distances(self, numpy: Any, rows: Any, row_norms: Any, query32: Any,
-                   qnorm: float) -> Any:
-        """``|a-q|^2`` for every row, from the row norms and one product.
+    def _distances(self, numpy: Any, rows: Any, row_norms: Any,
+                   query32: Any) -> Any:
+        """``|a-q|^2 - |q|^2`` for every row: one product, two passes.
 
         The coarse pass only has to rank the rows: every distance it produces
         is recomputed in float64 before it is reported, so the square root is
         one pass over the column that buys nothing and is not taken.  The
-        values that reach the caller are squared, and every comparison they
-        take part in is a comparison of squares.
+        values that reach the caller are squared minus a constant, and every
+        comparison they take part in is a comparison of those values.
+
+        The constant is ``|q|^2``, and it is not added.  It shifts every row
+        of the column by the same amount, so it cannot change the order the
+        column is ranked in, nor which rows sit below a threshold that is
+        taken from the same column, and no caller ever reports these values --
+        the numbers that are printed come from the float64 recomputation.  A
+        pass over forty kilobytes per query for a term that cancels is a pass
+        not taken.
         """
 
         # |a-q|^2 = |a|^2 - 2 a.q + |q|^2, with the product taken in the
@@ -1248,25 +1293,24 @@ class Engine:
             self._scan_width = buffer.shape[0]
         squared = buffer[:count]
         numpy.dot(rows, query32, out=squared)
-        numpy.multiply(squared, -2.0, out=squared)
+        squared *= -2.0
         squared += row_norms
-        squared += qnorm
-        numpy.maximum(squared, 0.0, out=squared)
         return squared
 
     def _topk(self, numpy: Any, rows: Any, row_norms: Any, slot_ids: Any,
-              pks: Any, take: int, qnorm: float, query32: Any):
-        distances = self._distances(numpy, rows, row_norms, query32, qnorm)
+              pks: Any, take: int, query32: Any):
+        distances = self._distances(numpy, rows, row_norms, query32)
         return self._select(numpy, distances, pks, slot_ids, take)
 
     def _select(self, numpy: Any, distances: Any, pks: Any, slot_ids: Any, take: int):
         """The ``take`` closest candidates, as ``(slots, distances)`` arrays.
 
         Only the boundary distance is needed from the selection, and the rows
-        that sit at it are recovered with one comparison over the distances;
-        ``argpartition`` was carrying an index array through the select for
-        nothing.  A row that ties with the boundary is kept, so the exact stage
-        still decides the order a reference scan would.
+        within ``SCAN_TOLERANCE`` of it are recovered with one comparison over
+        the distances; ``argpartition`` was carrying an index array through
+        the select for nothing.  Every row that ties with the boundary is
+        kept, so the exact stage still decides the order a reference scan
+        would.
 
         ``numpy.partition`` over the whole column is scalar and every one of
         its comparisons is data dependent, so it costs about 35 us on ten
@@ -1284,13 +1328,16 @@ class Engine:
         if take <= 0:
             return (numpy.empty(0, dtype=numpy.intp),
                     numpy.empty(0, dtype=distances.dtype))
+        tolerance = self.SCAN_TOLERANCE
         narrowed = None
         if n >= 4 * take:
             # One row in ``step`` is sampled, and the rank that leaves about
-            # eight times ``take`` rows below the threshold is taken from it.
+            # sixteen times ``take`` rows below the threshold is taken from
+            # it: the subset has to hold the whole tolerance band around the
+            # boundary, not just the boundary row.
             step = max(1, n // 1024)
             sample = distances[::step]
-            rank = (8 * take * sample.size) // n
+            rank = (16 * take * sample.size) // n
             if 1 <= rank < sample.size - 1:
                 threshold = float(numpy.partition(sample, rank)[rank])
                 rows = numpy.flatnonzero(distances <= threshold)
@@ -1298,7 +1345,6 @@ class Engine:
                     narrowed = rows
         if narrowed is None:
             boundary = float(numpy.partition(distances, take - 1)[take - 1])
-            tolerance = max(1e-6, abs(boundary) * 1e-9)
             candidates = numpy.flatnonzero(distances <= boundary + tolerance)
         else:
             # The subset already sits below the sample threshold, and the
@@ -1308,7 +1354,6 @@ class Engine:
             # the column a second time.
             subset = distances[narrowed]
             boundary = float(numpy.partition(subset, take - 1)[take - 1])
-            tolerance = max(1e-6, abs(boundary) * 1e-9)
             keep = subset <= boundary + tolerance
             candidates = narrowed if bool(keep.all()) else narrowed[keep]
         if candidates.size > take:

@@ -758,6 +758,66 @@ _SELECT_HEAD_RE = re.compile(r"[ \t\r\n]*SELECT[ \t\r\n]+", re.IGNORECASE)
 _COMPARISONS = ("<=", ">=", "<>", "!=", "=", "<", ">")
 
 
+# The one statement shape the benchmark repeats: a primary key and the
+# distance to one literal, from one table, optionally narrowed by one equality
+# on a text column, ordered by that distance and cut to k rows.
+#
+# The scanner below reads the same statement correctly, but it reads it a
+# character at a time and builds a node per item: measured on a 1.4 kB query
+# it costs 9 us, of which 1.3 kB is the vector literal it has to walk past.
+# One regular expression over the same text costs 1.5 us and lands on the same
+# nodes, so the shape is recognised here first and every other statement --
+# including every statement that is nearly this shape -- falls through to the
+# scanner unchanged.  The identifiers are checked against KEYWORDS because the
+# scanner rejects a keyword used as a name and this expression would not, and
+# every quoted part excludes the characters that need unescaping: anything
+# unusual simply does not match.
+_TOPK_RE = re.compile(
+    r"[ \t\r\n]*SELECT[ \t\r\n]+"
+    r"([A-Za-z_][A-Za-z0-9_$]*)[ \t\r\n]*,[ \t\r\n]*"
+    r"L2_DISTANCE[ \t\r\n]*\([ \t\r\n]*([A-Za-z_][A-Za-z0-9_$]*)"
+    r"[ \t\r\n]*,[ \t\r\n]*'(\[[^'\\]*\])'[ \t\r\n]*\)"
+    r"[ \t\r\n]+AS[ \t\r\n]+([A-Za-z_][A-Za-z0-9_$]*)"
+    r"[ \t\r\n]+FROM[ \t\r\n]+([A-Za-z_][A-Za-z0-9_$]*)"
+    r"(?:[ \t\r\n]+WHERE[ \t\r\n]+([A-Za-z_][A-Za-z0-9_$]*)"
+    r"[ \t\r\n]*=[ \t\r\n]*'([^'\\]*)')?"
+    r"[ \t\r\n]+ORDER[ \t\r\n]+BY[ \t\r\n]+([A-Za-z_][A-Za-z0-9_$]*)"
+    r"[ \t\r\n]+LIMIT[ \t\r\n]+([0-9]+)"
+    r"[ \t\r\n]*;?[ \t\r\n]*\Z", re.IGNORECASE)
+
+
+def fast_topk(sql: str) -> dict | None:
+    """The statement dict of a plain TopK query, or ``None``.
+
+    Exactly the nodes :func:`scan_select` builds for the same text, so the two
+    cannot disagree: a name that is a keyword, a quoted part that needs
+    unescaping, or any clause this expression does not spell out returns
+    ``None`` and the scanner runs.
+    """
+
+    match = _TOPK_RE.fullmatch(sql)
+    if match is None:
+        return None
+    key, vector, text, alias, table, where_key, where_value, order, limit = \
+        match.groups()
+    for name in (key, vector, alias, table, order, where_key):
+        if name is not None and name.upper() in KEYWORDS:
+            return None
+    return {
+        "kind": "select",
+        "items": [{"expr": ("col", key), "alias": None},
+                  {"expr": ("func", "L2_DISTANCE",
+                            [("col", vector), ("str", text)]),
+                   "alias": alias}],
+        "table": table,
+        "where": (None if where_key is None else
+                  ("binop", "=", ("col", where_key), ("str", where_value))),
+        "order": [(("col", order), False)],
+        "limit": int(limit),
+        "offset": 0,
+    }
+
+
 def scan_select(sql: str) -> dict | None:
     """Parse a plain ``SELECT`` in one pass, without the tokenizer.
 
@@ -964,6 +1024,9 @@ def scan_select(sql: str) -> dict | None:
 
 
 def parse(sql: str) -> dict:
+    statement = fast_topk(sql)
+    if statement is not None:
+        return statement
     statement = scan_insert_values(sql)
     if statement is not None:
         return statement
@@ -977,4 +1040,5 @@ def parse(sql: str) -> dict:
     return statement
 
 
-__all__ = ["parse", "tokenize", "Parser", "Token", "parse_vector_literal"]
+__all__ = ["parse", "fast_topk", "tokenize", "Parser", "Token",
+           "parse_vector_literal"]
