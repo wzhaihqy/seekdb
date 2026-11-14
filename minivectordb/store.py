@@ -435,6 +435,10 @@ class ColumnarStore:
                 self._lens.append(None)
         self._index = PkIndex()
         self._numpy_cache: dict = {}
+        # Bumped by every row write.  The dictionaries and the float64 copy
+        # of a column are keyed on it, so an UPDATE that changes a value in
+        # place cannot leave a stale view behind for the next query.
+        self._version = 0
         self._rebuild_index()
 
     # -- geometry ----------------------------------------------------------
@@ -508,6 +512,69 @@ class ColumnarStore:
                 length = _U32.unpack(self._lens[position].read(slot * 4, 4))[0]
                 values.append(self._arena[position].read(offset, length).decode("utf-8"))
         return values
+
+    def read_slots_columns(self, slots: Sequence[int],
+                           positions: Sequence[int]) -> list[list[Any]]:
+        """Read the given columns of several slots with one read per column.
+
+        The projected rows of a TopK query are usually contiguous, and a
+        read per slot costs a system call each.  The slot range that covers
+        them is read once per column and the values are sliced out of it,
+        which turns a handful of syscalls into one.
+        """
+
+        width = len(self.columns)
+        rows: list[list[Any]] = [[None] * width for _ in slots]
+        if not slots or not positions:
+            return rows
+        low = min(slots)
+        span = max(slots) - low + 1
+        for position in positions:
+            column = self.columns[position]
+            nulls = self._nulls[position].read(low, span)
+            if column.type == BIGINT:
+                data = self._arena[position].read(low * 8, span * 8)
+                for index, slot in enumerate(slots):
+                    if nulls[slot - low]:
+                        continue
+                    start = (slot - low) * 8
+                    rows[index][position] = _I64.unpack(data[start:start + 8])[0]
+            elif column.type == VECTOR:
+                size = (column.dim or 0) * 4
+                data = self._arena[position].read(low * size, span * size)
+                for index, slot in enumerate(slots):
+                    if nulls[slot - low]:
+                        continue
+                    start = (slot - low) * size
+                    vec = array.array("f")
+                    vec.frombytes(data[start:start + size])
+                    rows[index][position] = vec
+            else:
+                offsets = self._offs[position].read(low * 8, span * 8)
+                lengths = self._lens[position].read(low * 4, span * 4)
+                for index, slot in enumerate(slots):
+                    if nulls[slot - low]:
+                        continue
+                    at = slot - low
+                    offset = _U64.unpack(offsets[at * 8:at * 8 + 8])[0]
+                    length = _U32.unpack(lengths[at * 4:at * 4 + 4])[0]
+                    rows[index][position] = self._arena[position].read(
+                        offset, length).decode("utf-8")
+        return rows
+
+    def read_slots_pk(self, slots: Sequence[int]) -> list[int]:
+        """The primary keys of several slots, with one read for all of them."""
+
+        if not slots:
+            return []
+        low = min(slots)
+        span = max(slots) - low + 1
+        data = self._pk.read(low * 8, span * 8)
+        keys = []
+        for slot in slots:
+            start = (slot - low) * 8
+            keys.append(_I64.unpack(data[start:start + 8])[0])
+        return keys
 
     def read_slot_columns(self, slot: int, positions: Sequence[int]) -> list[Any]:
         """Read the given columns of one slot into a full length list.
@@ -686,6 +753,31 @@ class ColumnarStore:
         self._numpy_cache[key] = (size, norms)
         return norms
 
+    def vector_norms32(self, position: int) -> Any:
+        """Squared ``float64`` norm of every row, from the ``float32`` column.
+
+        The scan keeps the vector column in its stored precision and turns
+        the distances into one matrix product: ``|a-q|^2 = |a|^2 - 2 a.q +
+        |q|^2``.  Reading the column once at ``float32`` halves the bytes the
+        scan has to touch, and computing the norms in ``float64`` keeps the
+        ranking terms at the precision the reference distance uses.
+        """
+
+        if not fastpath.available():
+            return None
+        matrix = self.fixed_column_array(position)
+        if matrix is None:
+            return None
+        count = matrix.shape[0]
+        key = ("norm32", position)
+        entry = self._numpy_cache.get(key)
+        if entry is not None and entry[0] == self._version and entry[1] == count:
+            return entry[2]
+        numpy = fastpath.module()
+        norms = (matrix * matrix).sum(axis=1, dtype=numpy.float32)
+        self._numpy_cache[key] = (self._version, count, norms)
+        return norms
+
     def null_mask(self, position: int) -> Any:
         """A boolean array that is ``True`` where the slot holds NULL."""
 
@@ -695,7 +787,15 @@ class ColumnarStore:
                              "u1", self.slot_count, 1, self._nulls[position].size)
         if flags is None:
             return None
-        return flags.astype(bool)
+        # The conversion to bool is cached: the scan asks for it on every
+        # query and the array is one element per slot.
+        key = ("nullb", position)
+        entry = self._numpy_cache.get(key)
+        if entry is not None and entry[0] == self._version:
+            return entry[1]
+        converted = flags.astype(bool)
+        self._numpy_cache[key] = (self._version, converted)
+        return converted
 
     def live_mask(self) -> Any:
         """A boolean array that is ``True`` where the slot holds a live row."""
@@ -706,7 +806,13 @@ class ColumnarStore:
                              1, self._live.size)
         if flags is None:
             return None
-        return flags.astype(bool)
+        key = ("liveb",)
+        entry = self._numpy_cache.get(key)
+        if entry is not None and entry[0] == self._version:
+            return entry[1]
+        converted = flags.astype(bool)
+        self._numpy_cache[key] = (self._version, converted)
+        return converted
 
     def primary_keys(self) -> Any:
         """The primary key of every slot as an ``int64`` array."""
@@ -715,6 +821,64 @@ class ColumnarStore:
             return None
         return self._mapped(("pk",), self._pk.path, "<i8", self.slot_count,
                              1, self._pk.size)
+
+    def varchar_codes(self, position: int):
+        """Dictionary codes of a ``VARCHAR`` column, one ``int32`` per slot.
+
+        The equality filter of a query decodes every value of the column and
+        compares the bytes, which costs more than the vector scan it is
+        supposed to narrow down.  Encoding the column once turns
+        ``WHERE category = 'x'`` into one integer comparison per slot: the
+        literal is looked up in the dictionary and the mask is
+        ``codes == code``.
+
+        Returns ``(codes, index, values)`` where ``index`` maps the bytes of
+        a value to its code and ``values`` is the code to bytes table.  A
+        NULL slot keeps the code ``-1``.  The result is ``None`` when numpy
+        is unavailable, so the caller falls back to the byte comparison.
+        """
+
+        if not fastpath.available():
+            return None
+        if position >= len(self.columns) or self.columns[position].type != VARCHAR:
+            return None
+        count = self.slot_count
+        if count == 0:
+            return None
+        key = ("vcode", position)
+        entry = self._numpy_cache.get(key)
+        if entry is not None and entry[0] == self._version and entry[1] == count:
+            return entry[2]
+        offsets = self._mapped(("off", position), self._offs[position].path,
+                              "<u8", count)
+        lengths = self._mapped(("len", position), self._lens[position].path,
+                               "<u4", count)
+        if offsets is None or lengths is None:
+            return None
+        numpy = fastpath.module()
+        arena = self._arena[position].read_all()
+        nulls = self.null_mask(position)
+        offsets = offsets.tolist()
+        lengths = lengths.tolist()
+        null_flags = nulls.tolist() if nulls is not None else None
+        codes = numpy.full(count, -1, dtype=numpy.int32)
+        index: dict[bytes, int] = {}
+        values: list[bytes] = []
+        lookup = index.get
+        for slot in range(count):
+            if null_flags is not None and null_flags[slot]:
+                continue
+            start = offsets[slot]
+            value = arena[start:start + lengths[slot]]
+            code = lookup(value)
+            if code is None:
+                code = len(values)
+                index[value] = code
+                values.append(value)
+            codes[slot] = code
+        result = (codes, index, values)
+        self._numpy_cache[key] = (self._version, count, result)
+        return result
 
     def varchar_column_bytes(self, position: int, start: int = 0,
                              end: int | None = None) -> tuple[Any, Any, Any]:
@@ -772,6 +936,7 @@ class ColumnarStore:
         self._write_slot(slot, values)
 
     def _write_slot(self, slot: int, values: Sequence[Any]) -> None:
+        self._version += 1
         for position, column in enumerate(self.columns):
             value = values[position] if position < len(values) else None
             if value is None:
@@ -805,6 +970,7 @@ class ColumnarStore:
         slot = self._index.get(pk)
         if slot is None:
             return
+        self._version += 1
         self._live.write_at(slot, b"\x00")
         self._index.remove(pk)
 

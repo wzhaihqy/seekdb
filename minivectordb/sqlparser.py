@@ -754,8 +754,220 @@ def _scan_value(sql: str, pos: int) -> tuple[Any, int] | None:
     return ("lit", int(text)), match.end()
 
 
+_SELECT_HEAD_RE = re.compile(r"[ \t\r\n]*SELECT[ \t\r\n]+", re.IGNORECASE)
+_COMPARISONS = ("<=", ">=", "<>", "!=", "=", "<", ">")
+
+
+def scan_select(sql: str) -> dict | None:
+    """Parse a plain ``SELECT`` in one pass, without the tokenizer.
+
+    The TopK query of the benchmark is asked a thousand times with a few
+    hundred characters of vector literal in it, and building one token
+    object per literal costs more than the scan it drives.  This scanner
+    reads the statement directly and produces exactly the nodes the generic
+    parser produces.
+
+    Only the plain shape is accepted -- ``*`` or column/function items, one
+    table, an optional ``column <op> literal`` filter, one ``ORDER BY`` term
+    and ``LIMIT``.  Anything else returns ``None`` and the generic parser
+    runs unchanged, so the accepted syntax and the reported errors stay
+    exactly where they were.
+    """
+
+    head = _SELECT_HEAD_RE.match(sql)
+    if head is None:
+        return None
+    pos = head.end()
+    length = len(sql)
+
+    def skip(at: int) -> int:
+        while at < length and sql[at] in _WHITESPACE:
+            at += 1
+        return at
+
+    def word(at: int):
+        """``(name, end)`` of an identifier at ``at``, or ``None``."""
+
+        match = _IDENT_RE.match(sql, at)
+        if match is None:
+            return None, at
+        name = match.group(1)
+        if name.upper() in KEYWORDS:
+            return None, at
+        return name, match.end()
+
+    def keyword(at: int, text: str) -> int:
+        """End of the keyword at ``at``, or ``-1``."""
+
+        at = skip(at)
+        if sql[at:at + len(text)].upper() != text:
+            return -1
+        after = at + len(text)
+        if after < length and (sql[after].isalnum() or sql[after] in "_$"):
+            return -1
+        return after
+
+    def literal(at: int):
+        """``(node, end)`` of a string or number literal."""
+
+        at = skip(at)
+        if at < length and sql[at] == "'":
+            end = _scan_string(sql, at)
+            return ("str", _decode_string(sql[at:end])), end
+        match = _NUMBER_RE.match(sql, at)
+        if match is None:
+            return None, at
+        text = match.group()
+        if "." in text or "e" in text or "E" in text:
+            return ("lit", float(text)), match.end()
+        return ("lit", int(text)), match.end()
+
+    items: list[dict] = []
+    at = skip(pos)
+    if at < length and sql[at] == "*":
+        items.append({"expr": ("star",), "alias": None})
+        pos = at + 1
+    else:
+        while True:
+            at = skip(pos)
+            name, end = word(at)
+            if name is None:
+                return None
+            pos = end
+            at = skip(pos)
+            if at < length and sql[at] == "(":
+                if name.upper() in AGGREGATE_FUNCTIONS:
+                    return None
+                pos = at + 1
+                args: list[Any] = []
+                at = skip(pos)
+                if at < length and sql[at] == ")":
+                    pos = at + 1
+                else:
+                    while True:
+                        at = skip(pos)
+                        if at < length and sql[at] == "'":
+                            node, pos = literal(at)
+                        else:
+                            arg_name, end = word(at)
+                            if arg_name is not None:
+                                node, pos = ("col", arg_name), end
+                            else:
+                                node, pos = literal(at)
+                        if node is None:
+                            return None
+                        args.append(node)
+                        at = skip(pos)
+                        if at < length and sql[at] == ",":
+                            pos = at + 1
+                            continue
+                        if at < length and sql[at] == ")":
+                            pos = at + 1
+                            break
+                        return None
+                expr: Any = ("func", name.upper(), args)
+            else:
+                expr = ("col", name)
+            alias = None
+            end = keyword(pos, "AS")
+            if end >= 0:
+                at = skip(end)
+                alias, pos = word(at)
+                if alias is None:
+                    return None
+            items.append({"expr": expr, "alias": alias})
+            at = skip(pos)
+            if at < length and sql[at] == ",":
+                pos = at + 1
+                continue
+            break
+
+    end = keyword(pos, "FROM")
+    if end < 0:
+        return None
+    at = skip(end)
+    table, pos = word(at)
+    if table is None:
+        return None
+
+    where = None
+    end = keyword(pos, "WHERE")
+    if end >= 0:
+        at = skip(end)
+        name, pos = word(at)
+        if name is None:
+            return None
+        at = skip(pos)
+        operator = None
+        for candidate in _COMPARISONS:
+            if sql.startswith(candidate, at):
+                operator = candidate
+                pos = at + len(candidate)
+                break
+        if operator is None:
+            return None
+        node, pos = literal(pos)
+        if node is None:
+            return None
+        where = ("binop", operator, ("col", name), node)
+
+    order: list[tuple[Any, bool]] = []
+    end = keyword(pos, "ORDER")
+    if end >= 0:
+        end = keyword(end, "BY")
+        if end < 0:
+            return None
+        at = skip(end)
+        name, pos = word(at)
+        if name is None:
+            return None
+        descending = False
+        end = keyword(pos, "DESC")
+        if end >= 0:
+            descending = True
+            pos = end
+        else:
+            end = keyword(pos, "ASC")
+            if end >= 0:
+                pos = end
+        order.append((("col", name), descending))
+        at = skip(pos)
+        if at < length and sql[at] == ",":
+            return None                     # a second ORDER BY term: generic path
+
+    limit = None
+    offset = 0
+    end = keyword(pos, "LIMIT")
+    if end >= 0:
+        at = skip(end)
+        match = re.match(r"[0-9]+", sql[at:])
+        if match is None:
+            return None
+        limit = int(match.group())
+        pos = at + match.end()
+        end = keyword(pos, "OFFSET")
+        if end >= 0:
+            at = skip(end)
+            match = re.match(r"[0-9]+", sql[at:])
+            if match is None:
+                return None
+            offset = int(match.group())
+            pos = at + match.end()
+
+    pos = skip(pos)
+    if pos < length and sql[pos] == ";":
+        pos += 1
+    if skip(pos) != length:
+        return None
+    return {"kind": "select", "items": items, "table": table, "where": where,
+            "order": order, "limit": limit, "offset": offset}
+
+
 def parse(sql: str) -> dict:
     statement = scan_insert_values(sql)
+    if statement is not None:
+        return statement
+    statement = scan_select(sql)
     if statement is not None:
         return statement
     parser = Parser(sql)
