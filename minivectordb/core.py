@@ -229,6 +229,21 @@ def l2_distance(left: Sequence[float], right: Sequence[float]) -> float:
     return math.sqrt(total)
 
 
+def l2_distance_floats(left, right) -> float:
+    """Euclidean distance over operands that already are python floats.
+
+    The arithmetic is the one of :func:`l2_distance`; only the conversion of
+    every element is dropped, which is safe because a float32 widened to
+    float64 and a python float are the same number.
+    """
+
+    total = 0.0
+    for a, b in zip(left, right):
+        diff = a - b
+        total += diff * diff
+    return math.sqrt(total)
+
+
 # ---------------------------------------------------------------- row encoding
 #
 # Frame layout (little endian):

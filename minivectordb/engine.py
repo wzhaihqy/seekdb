@@ -41,8 +41,8 @@ from .core import (BIGINT, CONSTRAINT_VIOLATION, DIMENSION_MISMATCH, DUPLICATE_K
                    KIND_INSERT, KIND_ROLLBACK, KIND_UPDATE, NO_SUCH_COLUMN,
                    NO_SUCH_TABLE, SqlError, TABLE_ALREADY_EXISTS, TRANSACTION_ERROR,
                    TYPE_MISMATCH, UNSUPPORTED_SQL, VECTOR, VARCHAR, Column, decode_row,
-                   decode_value, encode_row, l2_distance, parse_vector_literal,
-                   to_float32, to_float32_literal)
+                   decode_value, encode_row, l2_distance, l2_distance_floats,
+                   parse_vector_literal, to_float32, to_float32_literal)
 from .sqlparser import parse
 from .store import ColumnarStore, table_directory
 from . import fastpath
@@ -817,6 +817,35 @@ class Engine:
                 projections.append((expr, alias))
         return [alias for _, alias in projections], projections
 
+    def _projection_columns(self, table: Table, projections: list[tuple[Any, str]],
+                            distance_expression: Any) -> list[int]:
+        """The column positions the projection of a query really needs."""
+
+        wanted: set[int] = set()
+        for expr, _alias in projections:
+            if distance_expression is not None and expr == distance_expression:
+                continue
+            wanted |= self._expression_columns(table, expr)
+        return sorted(wanted)
+
+    def _expression_columns(self, table: Table, expr: Any) -> set[int]:
+        """The column positions an expression reads."""
+
+        if not isinstance(expr, tuple) or not expr:
+            return set()
+        tag = expr[0]
+        if tag == "col":
+            try:
+                return {table.column_index(expr[1])}
+            except (KeyError, ValueError):
+                return set()
+        if tag == "func":
+            columns: set[int] = set()
+            for argument in expr[2] or ():
+                columns |= self._expression_columns(table, argument)
+            return columns
+        return set()
+
     # -- vectorised TopK --------------------------------------------------
     #
     # The exact TopK scan is the hot path of the query benchmark: the generic
@@ -881,10 +910,27 @@ class Engine:
         # projection that shows the distance reuses that value instead of
         # computing it a second time.
         distance_expression = self._distance_expression(statement, expression)
+        # Only the columns the projection uses are read from the store; the
+        # vector column comes from the matrix the scan already holds.
+        wanted = self._projection_columns(table, projections, distance_expression)
+        matrix = store.vector_matrix64(column_position)
+        # The candidate vectors are taken in one numpy call; asking for one row
+        # at a time costs more than the scan itself.
+        vectors = None
+        if matrix is not None:
+            vectors = matrix[[slot for _distance, _pk, slot in candidates]].tolist()
+        # The query vector is used by the reference distance of every selected
+        # row; converting it once keeps the arithmetic the same and the cost
+        # out of the loop.
+        query_values = [float(value) for value in query]
         selected: list[tuple[float, int, list[Any]]] = []
-        for _distance, _pk, slot in candidates:
-            raw = store.read_slot(slot)
-            distance = l2_distance(_as_vector(raw[column_position]), query)
+        for index, (_distance, _pk, slot) in enumerate(candidates):
+            raw = store.read_slot_columns(slot, wanted)
+            if vectors is not None:
+                vector = vectors[index]
+            else:
+                vector = raw[column_position]
+            distance = l2_distance_floats(_as_vector(vector), query_values)
             values = []
             for expr, _alias in projections:
                 if distance_expression is not None and expr == distance_expression:

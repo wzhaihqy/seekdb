@@ -509,6 +509,33 @@ class ColumnarStore:
                 values.append(self._arena[position].read(offset, length).decode("utf-8"))
         return values
 
+    def read_slot_columns(self, slot: int, positions: Sequence[int]) -> list[Any]:
+        """Read the given columns of one slot into a full length list.
+
+        Columns that were not asked for stay ``None``.  The result has the
+        same shape as :meth:`_read_slot`, so the expression evaluation does
+        not have to know which columns were actually read.
+        """
+
+        values: list[Any] = [None] * len(self.columns)
+        for position in positions:
+            column = self.columns[position]
+            if self._nulls[position].read(slot, 1)[0]:
+                continue
+            if column.type == BIGINT:
+                values[position] = _I64.unpack(self._arena[position].read(slot * 8, 8))[0]
+            elif column.type == VECTOR:
+                size = (column.dim or 0) * 4
+                raw = self._arena[position].read(slot * size, size)
+                vec = array.array("f")
+                vec.frombytes(raw)
+                values[position] = vec
+            else:
+                offset = _U64.unpack(self._offs[position].read(slot * 8, 8))[0]
+                length = _U32.unpack(self._lens[position].read(slot * 4, 4))[0]
+                values[position] = self._arena[position].read(offset, length).decode("utf-8")
+        return values
+
     def iter_rows(self) -> Iterator[tuple[int, list[Any]]]:
         """Stream every live row in slot (insertion) order."""
         count = self.slot_count

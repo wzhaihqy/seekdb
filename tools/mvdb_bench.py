@@ -127,7 +127,40 @@ class Db:
         return response
 
     def handle(self):
-        return self.proc._handle  # type: ignore[attr-defined]
+        """The windows process handle, or None on other platforms."""
+
+        return getattr(self.proc, "_handle", None)
+
+    def pid(self):
+        return self.proc.pid
+
+
+def linux_counters(pid):
+    """Read the io counters and the peak memory of a process on linux."""
+
+    read_bytes = write_bytes = peak = 0
+    try:
+        with open("/proc/%d/io" % pid, "r", encoding="utf-8") as handle:
+            for line in handle:
+                name, _, value = line.partition(":")
+                value = value.strip()
+                if not value.isdigit():
+                    continue
+                if name == "rchar":
+                    read_bytes = int(value)
+                elif name == "wchar":
+                    write_bytes = int(value)
+    except OSError:
+        pass
+    try:
+        with open("/proc/%d/status" % pid, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmHWM:"):
+                    peak = int(line.split()[1]) * 1024
+                    break
+    except OSError:
+        pass
+    return read_bytes, write_bytes, peak
 
 
 def vector_literal(values):
@@ -199,8 +232,10 @@ def run(args):
             rows_returned += len(response.get("rows") or [])
         query_elapsed = time.perf_counter() - query_start
 
-        handle = db.proc._handle
-        read_bytes, write_bytes, peak = counters(handle)
+        if os.name == "nt":
+            read_bytes, write_bytes, peak = counters(db.handle())
+        else:
+            read_bytes, write_bytes, peak = linux_counters(db.pid())
         data_bytes = 0
         for base, _dirs, files in os.walk(data_dir):
             for name in files:
