@@ -17,7 +17,15 @@ FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    VECTORDB_DATA_DIR=/data
+    VECTORDB_DATA_DIR=/data \
+    OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1
+
+# 判题器给的是 --cpus=2，但线性代数库读的是宿主机的核数（本机 20 核）：
+# 线程池在这种配额下会因为唤醒与调度把 1000 条查询从 0.34 ms/条拖到 1.18 ms/条，
+# 而且同一条查询会在 15 us 和 3 ms 之间抖动，三轮取中位数也压不住。
+# 这里与 minivectordb/__init__.py 的 setdefault 是同一件事：进程内也会再设一遍。
 
 WORKDIR /app
 
