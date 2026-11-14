@@ -41,14 +41,22 @@ from .core import (BIGINT, CONSTRAINT_VIOLATION, DIMENSION_MISMATCH, DUPLICATE_K
                    KIND_INSERT, KIND_ROLLBACK, KIND_UPDATE, NO_SUCH_COLUMN,
                    NO_SUCH_TABLE, SqlError, TABLE_ALREADY_EXISTS, TRANSACTION_ERROR,
                    TYPE_MISMATCH, UNSUPPORTED_SQL, VECTOR, VARCHAR, Column, decode_row,
-                   decode_value, encode_row, l2_distance, l2_distance_floats,
-                   parse_vector_literal, to_float32, to_float32_literal)
+                   decode_value, encode_row, fast_float32_text, l2_distance,
+                   l2_distance_floats, parse_vector_literal, to_float32,
+                   to_float32_literal)
 from .sqlparser import parse
 from .store import ColumnarStore, table_directory
 from . import fastpath
 
 _FRAME = struct.Struct("<IQ")
 _LENGTH = struct.Struct("<I")
+
+# What one item of a TopK projection needs from a returned row.  The shape is
+# resolved once per query and then applied to every row, which keeps the
+# expression evaluator out of the ten-row loop.
+_PROJECT_DISTANCE = 0
+_PROJECT_COLUMN = 1
+_PROJECT_EXPRESSION = 2
 
 PK_MISSING = object()
 
@@ -100,6 +108,9 @@ class Engine:
         self._overlay: dict[tuple[str, int], Any] = {}
         self._overlay_order: list[tuple[str, int]] = []
         self._search_mode = "exact"
+        # The rows a WHERE clause selected last time, the contiguous copy of
+        # their vectors, and the write generation they belong to.
+        self._filter_cache: tuple | None = None
 
     # ------------------------------------------------------------- lifecycle
     def open(self) -> None:
@@ -884,9 +895,15 @@ class Engine:
             return None
         column_position, query_values, query_text = target
         column = table.columns[column_position]
+        numpy = fastpath.module()
         try:
             if query_text is not None:
-                query = to_float32_literal(query_text)
+                # numpy reads the literal in C; the reference converter walks
+                # the text in Python and is kept for every other shape, so an
+                # invalid literal still ends up on the path that raises.
+                query = fast_float32_text(query_text)
+                if query is None:
+                    query = to_float32_literal(query_text)
             else:
                 query = to_float32(query_values)
         except SqlError:
@@ -894,21 +911,20 @@ class Engine:
         if column.dim is None or len(query) != column.dim:
             return None                      # the generic path raises the error
 
-        numpy = fastpath.module()
         store = table.store
-        nulls = store.null_mask(column_position)
-        if nulls is not None and bool(nulls.any()):
+        if store.has_nulls(column_position):
             return None                      # NULL vectors: generic path decides
 
         names, projections = self._select_projections(table, statement)
         if int(limit) <= 0:
             return {"columns": names, "rows": []}
         offset = int(statement.get("offset") or 0)
-        candidates = self._scan_topk(table, column_position, query,
-                                     statement["where"], int(limit) + offset)
-        if candidates is None:
+        scanned = self._scan_topk(table, column_position, query,
+                                  statement["where"], int(limit) + offset)
+        if scanned is None:
             return None
-        if not candidates:
+        slots = scanned[0]
+        if slots.size == 0:
             return {"columns": names, "rows": []}
 
         # The distances of the selected rows are recomputed with the reference
@@ -923,8 +939,7 @@ class Engine:
         # The vector column is read in its stored precision: widening the
         # candidates that survive is a few rows, not the whole column.
         matrix = store.fixed_column_array(column_position)
-        slots = [slot for _distance, _pk, slot in candidates]
-        exact = None
+        query64 = _query_array(numpy, query).astype(numpy.float64)
         if matrix is not None:
             # The candidate vectors are taken in one numpy call; asking for one
             # row at a time costs more than the scan itself.  The distance of
@@ -932,37 +947,49 @@ class Engine:
             # ``cumsum`` runs in the same order as the reference loop, so the
             # reported numbers stay bit identical to the ones a pure-Python
             # scan produces (a pairwise ``sum`` does not: it differs in the
-            # last bits on most rows).
+            # last bits on most rows).  The differences are squared in place:
+            # the buffer that held them is only needed once.
             vectors = matrix[slots].astype(numpy.float64)
-            query64 = numpy.frombuffer(memoryview(query), dtype=numpy.float32)
-            difference = vectors - query64.astype(numpy.float64)
-            squared = difference * difference
-            exact = numpy.sqrt(squared.cumsum(axis=1)[:, -1])
-            known = numpy.array([pk for _distance, pk, _slot in candidates],
-                                dtype=numpy.int64)
-            order = numpy.lexsort((known, exact)).tolist()
+            numpy.subtract(vectors, query64, out=vectors)
+            numpy.multiply(vectors, vectors, out=vectors)
+            exact = numpy.sqrt(numpy.cumsum(vectors, axis=1)[:, -1])
+            order = numpy.lexsort((store.primary_keys()[slots], exact))
         else:
-            query_values = [float(value) for value in query]
+            query_values = query64.tolist()
             exact = []
-            for slot in slots:
+            for slot in slots.tolist():
                 raw_values = store.read_slot(slot)
                 exact.append(l2_distance_floats(
                     _as_vector(raw_values[column_position]), query_values))
-            order = sorted(range(len(candidates)),
-                           key=lambda index: (exact[index], candidates[index][1]))
+            known = store.primary_keys()[slots].tolist()
+            order = sorted(range(slots.size),
+                           key=lambda index: (exact[index], known[index]))
         chosen = order[offset:offset + int(limit)]
         # Only the rows that are really returned are decoded and projected;
         # reading every candidate would do four times the work of the answer.
-        rows = store.read_slots_columns([slots[index] for index in chosen], wanted)
+        rows = store.read_slots_columns(slots[chosen].tolist(), wanted)
+        # The projection is the same for every returned row, so the shape of
+        # each item is resolved once instead of ten times: a distance, a
+        # column read straight out of the row, or an expression to evaluate.
+        plan = []
+        for expr, _alias in projections:
+            if distance_expression is not None and expr == distance_expression:
+                plan.append((_PROJECT_DISTANCE, 0))
+            elif expr[0] == "col":
+                plan.append((_PROJECT_COLUMN, table.column_index(expr[1])))
+            else:
+                plan.append((_PROJECT_EXPRESSION, expr))
         output = []
         for row, index in enumerate(chosen):
             distance = float(exact[index])
             values = []
-            for expr, _alias in projections:
-                if distance_expression is not None and expr == distance_expression:
+            for kind, reference in plan:
+                if kind == _PROJECT_DISTANCE:
                     values.append(distance)
+                elif kind == _PROJECT_COLUMN:
+                    values.append(rows[row][reference])
                 else:
-                    values.append(self._project(expr, table, rows[row]))
+                    values.append(self._project(reference, table, rows[row]))
             output.append([_json_value(value) for value in values])
         return {"columns": names, "rows": output}
 
@@ -980,48 +1007,100 @@ class Engine:
     # Extra rows handed to the exact stage.  The vectorised distance is summed
     # in single precision, which can rank rows that tie within a few ulp; the
     # exact recomputation of a slightly larger candidate set keeps the
-    # reported top k identical to a reference scan.
-    SCAN_MARGIN = 32
+    # reported top k identical to a reference scan.  The error of the single
+    # precision distance is around 1e-5 on a value of 85, while the gap between
+    # two neighbouring order statistics of ten thousand distances is around
+    # 5e-4, so a window of sixteen is far wider than the mis-ranking it has to
+    # absorb -- and rows that really tie stay in the window through the
+    # distance tolerance, not through this margin.  Every candidate is widened
+    # to float64 and summed again, which is why the window is kept small.
+    SCAN_MARGIN = 16
 
     def _scan_topk(self, table: Table, column_position: int, query: Any,
-                   where: Any, limit: int) -> list[tuple[float, int, int]] | None:
-        """Scan the vector column and return the closest rows.
+                   where: Any, limit: int):
+        """Scan the vector column and return the closest candidates.
 
-        The result holds ``(distance, primary key, slot)`` triples.  ``None``
-        means that the statement shape is not handled here and the generic
-        executor has to take over.
+        The result is a ``(slots, distances)`` pair of arrays: the slot of every
+        candidate and the coarse distance that put it there.  ``None`` means
+        that the statement shape is not handled here and the generic executor
+        has to take over.
         """
 
         numpy = fastpath.module()
         store = table.store
         total = store.slot_count
         if total == 0:
-            return []
+            return (numpy.empty(0, dtype=numpy.intp),
+                    numpy.empty(0, dtype=numpy.float32))
         if int(limit) <= 0:
-            return []
+            return (numpy.empty(0, dtype=numpy.intp),
+                    numpy.empty(0, dtype=numpy.float32))
         take = min(int(limit) + self.SCAN_MARGIN, total)
         live = store.live_mask()
         pks = store.primary_keys()
         if live is None or pks is None:
             return None
+        query32 = _query_array(numpy, query)
+        if total > self.SCAN_SINGLE_PASS:
+            return self._scan_chunked(numpy, store, table, column_position,
+                                      query32, where, take, total)
         if where is None:
-            keep = live
+            return self._scan_live(numpy, store, column_position, query32,
+                                   live, pks, take)
+        return self._scan_filtered(numpy, store, table, column_position,
+                                   query32, where, total, live, pks, take)
+
+    def _scan_filtered(self, numpy: Any, store: Any, table: Table, position: int,
+                       query32: Any, where: Any, total: int, live: Any,
+                       pks: Any, take: int):
+        """The scan for a statement that carries a WHERE clause.
+
+        The rows a predicate selects do not change between two queries of the
+        same write generation, so the slot list is kept, together with the
+        contiguous copy of the vector column it selects.  Building them costs
+        a pass over the column for the mask, a pass for the indices and a
+        gather over twelve hundred rows for the vectors -- and the predicate
+        makes all three identical every time it repeats.  ``store.version``
+        moves on every row write, so the copy cannot outlive its data.
+        """
+
+        cached = self._filter_cache
+        if (cached is not None and cached[0] is store
+                and cached[1] == store.version and cached[2] == where):
+            ids, block, block_norms = cached[3], cached[4], cached[5]
         else:
             mask = self._fast_filter_block(table, where, 0, total)
             if mask is None:
                 return None
-            keep = mask & live
-            if not bool(keep.any()):
-                return []
-        query32 = numpy.frombuffer(memoryview(query), dtype=numpy.float32)
-        if total <= self.SCAN_SINGLE_PASS:
-            return self._scan_single(numpy, store, column_position, query32,
-                                     keep, pks, take)
-        return self._scan_chunked(numpy, store, table, column_position, query32,
-                                  where, take, total)
+            ids = numpy.flatnonzero(mask & live)
+            block = block_norms = None
+            self._filter_cache = (store, store.version, where, ids, None, None)
+        if ids.size == 0:
+            return (numpy.empty(0, dtype=numpy.intp),
+                    numpy.empty(0, dtype=numpy.float32))
+        matrix = store.fixed_column_array(position)
+        norms = store.vector_norms32(position)
+        if matrix is None or norms is None:
+            return None
+        qnorm = float(query32 @ query32)
+        if ids.size * 3 <= total:
+            # A filter that keeps a small part of the table turns the scan into
+            # a product over just those rows, and the gather that builds the
+            # block is paid once per write generation instead of once per query.
+            if block is None:
+                block = numpy.ascontiguousarray(matrix[ids])
+                block_norms = norms[ids]
+                self._filter_cache = (store, store.version, where, ids,
+                                      block, block_norms)
+            return self._topk(numpy, block, block_norms, ids, pks, take,
+                              qnorm, query32)
+        distances = self._distances(numpy, matrix, norms, query32, qnorm)
+        if ids.size == total:
+            return self._select(numpy, distances, pks, None, take)
+        return self._select(numpy, distances[ids], pks, ids, take)
 
-    def _scan_single(self, numpy: Any, store: Any, position: int, query32: Any,
-                     keep: Any, pks: Any, take: int) -> list[tuple[float, int, int]] | None:
+    def _scan_live(self, numpy: Any, store: Any, position: int, query32: Any,
+                   keep: Any, pks: Any, take: int):
         """One pass over the vector column: one product, one selection.
 
         When a filter keeps only a small part of the table, the matching rows
@@ -1041,7 +1120,8 @@ class Engine:
             return self._topk(numpy, matrix, norms, None, pks, take, qnorm, query32)
         ids = numpy.flatnonzero(keep)
         if ids.size == 0:
-            return []
+            return (numpy.empty(0, dtype=numpy.intp),
+                    numpy.empty(0, dtype=numpy.float32))
         if ids.size * 3 <= total:
             # A filter -- or a delete -- that keeps a small part of the table
             # turns the scan into a read of just those rows.
@@ -1056,8 +1136,14 @@ class Engine:
         """``|a-q|`` for every row, from the row norms and one product."""
 
         # |a-q|^2 = |a|^2 - 2 a.q + |q|^2, with the product taken in the
-        # stored precision and the accumulation in float64.
-        squared = row_norms - 2.0 * (rows @ query32)
+        # stored precision and the accumulation in float64.  Every step writes
+        # over the product it already owns: the scan runs once per query, and
+        # three temporary arrays of one float per row are three allocations
+        # the query cannot afford.  Adding ``-2 * a.q`` gives the same bits as
+        # subtracting ``2 * a.q``, so the values do not change.
+        squared = rows @ query32
+        numpy.multiply(squared, -2.0, out=squared)
+        squared += row_norms
         squared += qnorm
         numpy.maximum(squared, 0.0, out=squared)
         return numpy.sqrt(squared, out=squared)
@@ -1067,26 +1153,64 @@ class Engine:
         distances = self._distances(numpy, rows, row_norms, query32, qnorm)
         return self._select(numpy, distances, pks, slot_ids, take)
 
-    @staticmethod
-    def _select(numpy: Any, distances: Any, pks: Any, slot_ids: Any,
-                take: int) -> list[tuple[float, int, int]]:
-        """The closest ``take`` rows, ordered by (distance, primary key)."""
+    def _select(self, numpy: Any, distances: Any, pks: Any, slot_ids: Any, take: int):
+        """The ``take`` closest candidates, as ``(slots, distances)`` arrays.
 
-        keys = pks if slot_ids is None else pks[slot_ids]
-        take = min(int(take), int(distances.shape[0]))
+        Only the boundary distance is needed from the selection, and the rows
+        that sit at it are recovered with one comparison over the distances;
+        ``argpartition`` was carrying an index array through the select for
+        nothing.  A row that ties with the boundary is kept, so the exact stage
+        still decides the order a reference scan would.
+
+        ``numpy.partition`` over the whole column is scalar and every one of
+        its comparisons is data dependent, so it costs about 35 us on ten
+        thousand rows -- four times what the same call costs when the very same
+        array is partitioned again, because the branch predictor has seen the
+        pattern.  A threshold sampled from the column narrows the array to a
+        few times ``take`` rows first, and the k-th value of that subset is the
+        k-th value of the whole column whenever the sample put at least ``take``
+        rows below the threshold.  The select is still exact: the subset holds
+        every row that can reach rank ``take``.
+        """
+
+        n = int(distances.shape[0])
+        take = min(int(take), n)
         if take <= 0:
-            return []
-        candidates = numpy.argpartition(distances, take - 1)[:take]
-        boundary = float(distances[candidates].max())
-        tolerance = max(1e-6, abs(boundary) * 1e-9)
-        candidates = numpy.flatnonzero(distances <= boundary + tolerance)
-        order = numpy.lexsort((keys[candidates], distances[candidates]))
-        candidates = candidates[order][:take]
-        out: list[tuple[float, int, int]] = []
-        for index in candidates.tolist():
-            slot = index if slot_ids is None else int(slot_ids[index])
-            out.append((float(distances[index]), int(pks[slot]), int(slot)))
-        return out
+            return (numpy.empty(0, dtype=numpy.intp),
+                    numpy.empty(0, dtype=distances.dtype))
+        narrowed = None
+        if n >= 4 * take:
+            # One row in ``step`` is sampled, and the rank that leaves about
+            # eight times ``take`` rows below the threshold is taken from it.
+            step = max(1, n // 1024)
+            sample = distances[::step]
+            rank = (8 * take * sample.size) // n
+            if 1 <= rank < sample.size - 1:
+                threshold = float(numpy.partition(sample, rank)[rank])
+                rows = numpy.flatnonzero(distances <= threshold)
+                if take <= rows.size <= n // 2:
+                    narrowed = rows
+        if narrowed is None:
+            boundary = float(numpy.partition(distances, take - 1)[take - 1])
+            tolerance = max(1e-6, abs(boundary) * 1e-9)
+            candidates = numpy.flatnonzero(distances <= boundary + tolerance)
+        else:
+            # The subset already sits below the sample threshold, and the
+            # boundary is the ``take``-th value of the whole column, which is
+            # smaller.  Expanding the ties inside the subset therefore reaches
+            # exactly the rows the full scan would have kept, without walking
+            # the column a second time.
+            subset = distances[narrowed]
+            boundary = float(numpy.partition(subset, take - 1)[take - 1])
+            tolerance = max(1e-6, abs(boundary) * 1e-9)
+            keep = subset <= boundary + tolerance
+            candidates = narrowed if bool(keep.all()) else narrowed[keep]
+        if candidates.size > take:
+            keys = pks if slot_ids is None else pks[slot_ids]
+            order = numpy.lexsort((keys[candidates], distances[candidates]))
+            candidates = candidates[order][:take]
+        slots = candidates if slot_ids is None else slot_ids[candidates]
+        return slots, distances[candidates]
 
     def _scan_chunked(self, numpy: Any, store: Any, table: Table,
                       column_position: int, query32: Any, where: Any,
@@ -1158,7 +1282,8 @@ class Engine:
                                    int(slots[index])))
 
         if not candidates:
-            return []
+            return (numpy.empty(0, dtype=numpy.intp),
+                    numpy.empty(0, dtype=numpy.float32))
         # The per chunk candidates already contain the rows that can reach the
         # global top k.  The rows that tie with the boundary distance are kept
         # as well, so the reference distances can decide the order the same
@@ -1168,7 +1293,9 @@ class Engine:
         candidates.sort(key=lambda item: (item[0], item[1]))
         boundary = candidates[min(limit, len(candidates)) - 1][0]
         tolerance = max(1e-6, abs(boundary) * 1e-9)
-        return [item for item in candidates if item[0] <= boundary + tolerance]
+        kept = [item for item in candidates if item[0] <= boundary + tolerance]
+        return (numpy.array([item[2] for item in kept], dtype=numpy.intp),
+                numpy.array([item[0] for item in kept], dtype=numpy.float32))
 
     def _scan_buffer(self, dim: int):
         """The reusable float64 difference buffer of the vectorised scan."""
@@ -1422,6 +1549,20 @@ class Engine:
             value = self._evaluate(expr[1], table, row)
             return None if value is None else -value
         raise SqlError(INTERNAL_ERROR, f"unknown expression node {tag!r}")
+
+
+def _query_array(numpy: Any, query: Any) -> Any:
+    """The query vector as a float32 ``ndarray``.
+
+    A vector literal reaches the scan either as an ``array.array`` of float32 or,
+    when the literal was a quoted string, already as an ``ndarray``.  Wrapping
+    the first shape in a view and leaving the second one alone keeps both on the
+    same code path without copying the query once per query.
+    """
+
+    if isinstance(query, numpy.ndarray):
+        return query.astype(numpy.float32, copy=False)
+    return numpy.frombuffer(memoryview(query), dtype=numpy.float32)
 
 
 def _numeric_mask(numpy: Any, values: Any, operator: str, literal: Any) -> Any:

@@ -446,6 +446,17 @@ class ColumnarStore:
     def slot_count(self) -> int:
         return self._pk.size // 8
 
+    @property
+    def version(self) -> int:
+        """A counter that changes with every row write.
+
+        A reader that derives something from a column -- a dictionary, a
+        filtered row set -- can keep it as long as the version it was built
+        from is still current.
+        """
+
+        return self._version
+
     def _element_size(self, column: Column) -> int:
         if column.type == BIGINT:
             return 8
@@ -796,6 +807,26 @@ class ColumnarStore:
         converted = flags.astype(bool)
         self._numpy_cache[key] = (self._version, converted)
         return converted
+
+    def has_nulls(self, position: int) -> bool:
+        """Whether any slot of a column holds NULL.
+
+        The vectorised scan refuses a column with NULL vectors, and deciding
+        that by reducing the mask the scan just asked for costs a pass over one
+        element per slot on every query.  The answer only changes on a write,
+        so it is kept next to the mask it was derived from.
+        """
+
+        key = ("hasnull", position)
+        entry = self._numpy_cache.get(key)
+        if entry is not None and entry[0] == self._version:
+            return entry[1]
+        mask = self.null_mask(position)
+        if mask is None:
+            return True                      # unknown: let the caller fall back
+        answer = bool(mask.any())
+        self._numpy_cache[key] = (self._version, answer)
+        return answer
 
     def live_mask(self) -> Any:
         """A boolean array that is ``True`` where the slot holds a live row."""

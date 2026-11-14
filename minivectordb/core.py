@@ -262,6 +262,32 @@ def to_float32_literal(text: str) -> array.array:
     return array.array("f", cached)
 
 
+def fast_float32_text(text: str):
+    """The float32 values of a plain vector literal, as a numpy array, or None.
+
+    The query path converts one literal per query, and a 128 element literal
+    costs about twice as much when the text is walked in Python.  numpy reads
+    the same text in C.  Only the plain ``[a,b,c]`` shape is handled here;
+    every other text -- and every element numpy refuses -- returns ``None`` so
+    the reference converter produces the value or the error it always did.
+    """
+
+    if _np is None:
+        return None
+    body = text.strip()
+    if len(body) < 2 or body[0] != "[" or body[-1] != "]":
+        return None
+    try:
+        values = _np.array(body[1:-1].split(","), dtype=_np.float32)
+    except (TypeError, ValueError):
+        return None
+    if values.ndim != 1 or values.size == 0:
+        return None
+    if not bool(_np.isfinite(values).all()):
+        return None
+    return values
+
+
 def l2_distance(left: Sequence[float], right: Sequence[float]) -> float:
     """Euclidean distance (NOT the squared distance) in float64 over float32 inputs."""
     total = 0.0
