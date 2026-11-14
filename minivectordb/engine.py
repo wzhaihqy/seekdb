@@ -477,6 +477,13 @@ class Engine:
             if column.type != VECTOR:
                 raise SqlError(TYPE_MISMATCH, f"column {column.name} does not accept a vector")
             return self._check_vector(column, to_float32(node[1]))
+        if tag == "vec32":
+            # A vector literal that the fast INSERT scanner already packed
+            # into float32.  The bytes are the ones to_float32 would have
+            # produced, so only the dimension check is left.
+            if column.type != VECTOR:
+                raise SqlError(TYPE_MISMATCH, f"column {column.name} does not accept a vector")
+            return self._check_vector(column, node[1])
         if tag == "col":
             raise SqlError(TYPE_MISMATCH, "cannot assign a column reference here")
         raise SqlError(TYPE_MISMATCH, "unsupported value expression")

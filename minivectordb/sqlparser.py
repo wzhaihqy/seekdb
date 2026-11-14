@@ -17,7 +17,7 @@ import re
 from typing import Any
 
 from .core import (BIGINT, VECTOR, VARCHAR, Column, SqlError, SYNTAX_ERROR,
-                   UNSUPPORTED_SQL, parse_vector_literal)
+                   UNSUPPORTED_SQL, pack_vector_text, parse_vector_literal)
 
 TOKEN_RE = re.compile(r"""
     (?P<ws>\s+)
@@ -641,7 +641,123 @@ class Parser:
         raise SqlError(SYNTAX_ERROR, f"unexpected token near {token.value!r}")
 
 
+_INSERT_HEAD_RE = re.compile(
+    r"[ \t\r\n]*INSERT[ \t\r\n]+INTO[ \t\r\n]+(`?[A-Za-z_][A-Za-z0-9_$]*`?)"
+    r"[ \t\r\n]*(?:\(([^()]*)\))?[ \t\r\n]*VALUES[ \t\r\n]*", re.IGNORECASE)
+_NUMBER_RE = re.compile(r"-?(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?")
+_IDENT_RE = re.compile(r"`?([A-Za-z_][A-Za-z0-9_$]*)`?")
+_WHITESPACE = " \t\r\n"
+
+
+def scan_insert_values(sql: str) -> dict | None:
+    """Parse ``INSERT INTO t VALUES (...),(...);`` without the tokenizer.
+
+    A bulk insert carries one literal per column per row, so the generic
+    parser builds a token object for every one of them and walks the list
+    again to build the nodes.  This scanner reads the statement in one pass
+    and produces exactly the nodes the generic parser would produce, which
+    keeps every downstream rule -- column typing, key checks, the write-ahead
+    log -- untouched.
+
+    ``None`` means the statement has any shape this scanner does not handle
+    exactly (a keyword, an expression, a sub-select, trailing input); the
+    caller then runs the generic parser, which accepts the statement or
+    reports the error the same way it always did.
+    """
+
+    head = _INSERT_HEAD_RE.match(sql)
+    if head is None:
+        return None
+    table = head.group(1)
+    if table.startswith("`"):
+        table = table[1:-1]
+    columns: list[str] | None = None
+    raw_columns = head.group(2)
+    if raw_columns is not None:
+        columns = []
+        for piece in raw_columns.split(","):
+            match = _IDENT_RE.fullmatch(piece.strip())
+            if match is None:
+                return None
+            columns.append(match.group(1))
+
+    length = len(sql)
+    pos = head.end()
+    rows: list[list[Any]] = []
+    while True:
+        while pos < length and sql[pos] in _WHITESPACE:
+            pos += 1
+        if pos >= length or sql[pos] != "(":
+            return None
+        pos += 1
+        values: list[Any] = []
+        while True:
+            parsed = _scan_value(sql, pos)
+            if parsed is None:
+                return None
+            node, pos = parsed
+            values.append(node)
+            while pos < length and sql[pos] in _WHITESPACE:
+                pos += 1
+            if pos >= length:
+                return None
+            if sql[pos] == ",":
+                pos += 1
+                continue
+            if sql[pos] != ")":
+                return None
+            pos += 1
+            break
+        rows.append(values)
+        while pos < length and sql[pos] in _WHITESPACE:
+            pos += 1
+        if pos < length and sql[pos] == ",":
+            pos += 1
+            continue
+        break
+
+    if pos < length and sql[pos] == ";":
+        pos += 1
+    while pos < length and sql[pos] in _WHITESPACE:
+        pos += 1
+    if pos != length:
+        return None
+    return {"kind": "insert", "table": table, "columns": columns, "rows": rows}
+
+
+def _scan_value(sql: str, pos: int) -> tuple[Any, int] | None:
+    """One literal of a VALUES tuple and the offset just past it."""
+
+    length = len(sql)
+    while pos < length and sql[pos] in _WHITESPACE:
+        pos += 1
+    if pos >= length:
+        return None
+    char = sql[pos]
+    if char == "'":
+        end = _scan_string(sql, pos)
+        return ("str", _decode_string(sql[pos:end])), end
+    if char == "[":
+        end = sql.find("]", pos)
+        if end < 0:
+            return None
+        packed = pack_vector_text(sql[pos + 1:end])
+        if packed is None:
+            return None
+        return ("vec32", packed), end + 1
+    match = _NUMBER_RE.match(sql, pos)
+    if match is None:
+        return None
+    text = match.group()
+    if "." in text or "e" in text or "E" in text:
+        return ("lit", float(text)), match.end()
+    return ("lit", int(text)), match.end()
+
+
 def parse(sql: str) -> dict:
+    statement = scan_insert_values(sql)
+    if statement is not None:
+        return statement
     parser = Parser(sql)
     statement = parser.parse_statement()
     if parser.peek().kind != "eof":

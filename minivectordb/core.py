@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import array
 import math
+import re
 import struct
 from typing import Any, Sequence
 
@@ -181,6 +182,17 @@ def _to_float32_fast(values: Sequence[float]) -> array.array | None:
         return None
     if source.ndim != 1 or source.shape[0] != len(values):
         return None
+    # The common case is a finite, in range vector.  Narrowing it and testing
+    # the narrowed copy answers the question in two operations instead of the
+    # five the explicit bounds check needs, and the result is the same: a
+    # value that is NaN, infinite or outside the float32 range turns into a
+    # non finite float32.  Only the failing vectors take the slow path below,
+    # where the exact error can be reported.
+    packed = source.astype(_np.float32)
+    if bool(_np.isfinite(packed).all()):
+        out = array.array("f")
+        out.frombytes(packed.tobytes())
+        return out
     finite = _np.isfinite(source)
     over = _np.abs(source) > FLOAT32_MAX
     broken = _np.flatnonzero(~finite | over)
@@ -189,9 +201,39 @@ def _to_float32_fast(values: Sequence[float]) -> array.array | None:
         if not bool(finite[index]):
             raise SqlError(INVALID_VECTOR, "vector contains NaN or Infinity")
         raise SqlError(VALUE_OUT_OF_RANGE, "vector element overflows float32")
+    raise SqlError(VALUE_OUT_OF_RANGE, "vector element overflows float32")
+
+
+# The characters a plain vector literal is made of.  A body that matches is a
+# comma separated list of decimal numbers, which is the shape a generated
+# workload writes.  Anything else -- spaces, hex, "inf" -- takes the reference
+# path, so the accepted syntax and the reported errors do not move.
+_PLAIN_VECTOR_BODY = re.compile(r"[+-]?[0-9.eE+-]+(?:,[+-]?[0-9.eE+-]+)*")
+
+
+def pack_vector_text(body: str) -> array.array | None:
+    """Pack a plain ``1.0,-2.5`` body into float32, or return ``None``.
+
+    The numbers are read by the C parser of numpy and narrowed exactly the
+    way :func:`to_float32` narrows them, so the stored bytes are the ones the
+    reference loop produces.  Every input that loop would reject -- a bad
+    token, NaN, Infinity, a float32 overflow -- comes back as ``None`` and is
+    decided by the reference implementation instead.
+    """
+
+    if _np is None or not body:
+        return None
+    if _PLAIN_VECTOR_BODY.fullmatch(body) is None:
+        return None
+    try:
+        source = _np.array(body.split(","), dtype=_np.float64)
+    except (TypeError, ValueError):
+        return None
+    if source.ndim != 1:
+        return None
     packed = source.astype(_np.float32)
     if not bool(_np.isfinite(packed).all()):
-        raise SqlError(VALUE_OUT_OF_RANGE, "vector element overflows float32")
+        return None
     out = array.array("f")
     out.frombytes(packed.tobytes())
     return out
