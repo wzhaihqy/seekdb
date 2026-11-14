@@ -51,7 +51,13 @@ def main(argv=None):
                         help="skip the slowest suite")
     args = parser.parse_args(argv)
 
-    environment = dict(os.environ, MVDB_PKG=WS)
+    # The bulk and memory suites write a few hundred MiB.  On this machine
+    # /tmp is a 10 MiB tmpfs, so a suite that trusts tempfile fails with
+    # ENOSPC and looks like a data bug.  Give the children a workspace scratch
+    # directory instead of relying on the default.
+    scratch = os.environ.get("MVDB_TMP") or os.path.join(WS, ".mvdb_tmp")
+    os.makedirs(scratch, exist_ok=True)
+    environment = dict(os.environ, MVDB_PKG=WS, MVDB_TMP=scratch, TMPDIR=scratch)
     checks = 0
     failures = 0
     for name, script, patterns, count_of, failures_of in SUITES:

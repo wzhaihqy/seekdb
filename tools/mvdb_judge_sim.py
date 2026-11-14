@@ -30,8 +30,23 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 WS = os.path.dirname(HERE)
 PKG = os.environ.get("MVDB_PKG") or os.path.join(WS, "seekdb-round2")
+if not os.path.isdir(os.path.join(PKG, "protocol_check")):
+    # The official tarball unpacks as seekdb-round2/; a git checkout is its own
+    # package root.  Both should work without exporting MVDB_PKG by hand.
+    PKG = WS
 MAIN = os.path.join(PKG, "main.py")
 PYTHON = sys.executable
+
+# The bulk and memory scenarios write a few hundred MiB of rows.  A container
+# image whose /tmp is a small tmpfs fails them with ENOSPC, which reads like a
+# storage bug but is the scratch directory.  Use a workspace scratch dir unless
+# the caller named one.
+_SCRATCH = os.environ.get("MVDB_TMP") or os.path.join(WS, ".mvdb_tmp")
+try:
+    os.makedirs(_SCRATCH, exist_ok=True)
+    tempfile.tempdir = _SCRATCH
+except OSError:
+    pass
 
 sys.path.insert(0, os.path.join(PKG, "protocol_check"))
 from _assertions import assert_response  # noqa: E402
