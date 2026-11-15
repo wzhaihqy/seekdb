@@ -881,6 +881,10 @@
       {
        "pointer": "/experiments/43/result",
        "quote": "1 线程 69 us；2 线程 38 us；按掩码（20）p50 14 us、均值 413 us（14 us 与 3 ms 交替双峰）。分数据用的是均值，所以「p50 最快」的那档在计分口径下是最慢的。引擎侧单查询均值 107.9 → 84.3 us。"
+      },
+      {
+       "pointer": "/experiments/45/conclusion",
+       "quote": "取舍的判据不是「看起来对不对」，而是「哪个仪器能分辨这个效应」；小效应要在噪声更低的层上验证，但结论要回到目标口径上表述。"
       }
      ],
      "verification": "1 线程 69 us、2 线程 38 us；20 线程 p50 14 us 但均值 413 us（14 us 与 3 ms 交替的双峰）——而分数用的是均值。于是实现成 min(2, 可见核数)。",
@@ -1042,6 +1046,10 @@
       {
        "pointer": "/experiments/41/result",
        "quote": "长度 93 字符；/user 返回 login=wzhaihqy；仓库 permissions 含 push=true；push 成功 3c07c8f7..ed466ccf。"
+      },
+      {
+       "pointer": "/experiments/9/conclusion",
+       "quote": "假设错了：OverflowError 那条分支是死代码，CPython 3.12 的 array('f') 溢出时静默变 inf。这类错误只有在真的按题面条款造反例时才会暴露，靠跑公开用例发现不了。"
       }
      ],
      "verification": "/user 返回 login=wzhaihqy、permissions.push=true、push 成功——原判断被推翻，省掉一次「重新生成令牌」的往返。",
@@ -1104,6 +1112,10 @@
       {
        "pointer": "/experiments/27/conclusion",
        "quote": "评测材料里的每条实验都指向一个能重新跑出同样数字的命令，这比实验本身的结论更重要：结论会过期，命令不会。"
+      },
+      {
+       "pointer": "/experiments/25/conclusion",
+       "quote": "这条 bug 是我自己打开快路径才引入的，人工读代码时它藏在 \"limit\" 变量旁边，一眼看不出来。差分测试的价值就在这里：它不依赖我记得检查什么。"
       }
      ],
      "verification": "conformance 263 项 / 0 失败成为每轮提交的门槛；此后每次提交前都贴这一条的输出，而不是贴零散脚本的结果。",
