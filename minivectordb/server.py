@@ -117,6 +117,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import numpy  # noqa: F401
         _log(f"numpy {numpy.__version__}: vector fast path enabled")
+        # The static thread choice in __init__ trusts /sys topology, which a
+        # container can trim.  Ask the silicon instead:  run the workload's
+        # own product under one and two workers and keep the winner.  Costs a
+        # few milliseconds before "ready"; leaves the static answer untouched
+        # when it cannot run.
+        from minivectordb import _calibrate
+        verdict = _calibrate.calibrate()
+        if verdict:
+            threads, two_us, one_us = verdict
+            _log(f"blas workers calibrated: {threads} "
+                 f"(two={two_us}us one={one_us}us, median of 24)")
     except Exception as exc:  # noqa: BLE001 - the fallback is a valid mode
         _log(f"numpy unavailable ({exc!r}): pure standard library path")
     return serve(data_dir)
