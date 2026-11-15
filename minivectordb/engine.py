@@ -69,8 +69,41 @@ DELETE = object()
 CHECKPOINT_BYTES = 64 * 1024 * 1024
 
 
+def _shape(expr: Any) -> Any:
+    """What an expression *is*, with every literal reduced to its kind.
+
+    Two ``L2_DISTANCE`` calls over the same column differ only in the vector
+    they carry, and that difference is the one thing a cached plan must ignore:
+    the plan says which projection item shows the distance, and that answer is
+    the same for every literal.  Everything that can change a plan -- a column
+    name, a function name -- stays in the shape.
+    """
+
+    if not isinstance(expr, tuple) or not expr:
+        return expr
+    tag = expr[0]
+    if tag == "col":
+        return ("col", expr[1].lower())
+    if tag == "func":
+        return ("func", expr[1], tuple(_shape(arg) for arg in (expr[2] or ())))
+    if tag in ("str", "vec", "lit"):
+        return (tag,)
+    return expr
+
+
+def _shape_key(statement: dict) -> Any:
+    """A hashable identity for a statement, literals reduced to their kind."""
+
+    return (statement["table"].lower(),
+            tuple((_shape(item["expr"]), item["alias"]) for item in statement["items"]),
+            _shape(statement["where"]) if statement["where"] is not None else None,
+            tuple((_shape(expr), descending) for expr, descending in statement["order"]),
+            statement["limit"], statement.get("offset") or 0)
+
+
 class Table:
-    __slots__ = ("name", "columns", "primary_key", "indexes", "store")
+    __slots__ = ("name", "columns", "primary_key", "indexes", "store",
+                 "by_name", "fast_plans")
 
     def __init__(self, name: str, columns: list[Column], directory: str) -> None:
         self.name = name
@@ -79,18 +112,27 @@ class Table:
         self.indexes: dict[str, str] = {}          # index name -> column name
         # pk -> row values, stored column-wise in files under /data
         self.store = ColumnarStore(directory, columns)
+        # Column lookup by lower-cased name.  A query reaches it about twenty
+        # times through projection and filter resolution, and walking four
+        # columns with ``lower()`` each time was the second largest Python
+        # cost of a query after the scan itself.
+        self.by_name: dict[str, int] = {}
+        for position, column in enumerate(columns):
+            self.by_name.setdefault(column.name.lower(), position)
+        # The resolved half of every statement shape this table has served.
+        self.fast_plans: dict[Any, Any] = {}
 
     def column(self, name: str) -> Column:
-        for candidate in self.columns:
-            if candidate.name.lower() == name.lower():
-                return candidate
-        raise SqlError(NO_SUCH_COLUMN, f"unknown column {name!r} in table {self.name!r}")
+        position = self.by_name.get(name.lower())
+        if position is None:
+            raise SqlError(NO_SUCH_COLUMN, f"unknown column {name!r} in table {self.name!r}")
+        return self.columns[position]
 
     def column_index(self, name: str) -> int:
-        for position, candidate in enumerate(self.columns):
-            if candidate.name.lower() == name.lower():
-                return position
-        raise SqlError(NO_SUCH_COLUMN, f"unknown column {name!r} in table {self.name!r}")
+        position = self.by_name.get(name.lower())
+        if position is None:
+            raise SqlError(NO_SUCH_COLUMN, f"unknown column {name!r} in table {self.name!r}")
+        return position
 
 
 class Engine:
@@ -881,6 +923,140 @@ class Engine:
     # numpy matrix, computes every distance in a single pass and only decodes
     # the rows that survive the LIMIT.
 
+    # How many statement shapes a table keeps resolved.  A benchmark uses one;
+    # the cap only stops a client that never repeats itself from growing it.
+    _FAST_PLAN_LIMIT = 64
+
+    def _fast_plan(self, table: Table, statement: dict):
+        """The half of a TopK query that does not change between queries.
+
+        A thousand queries arrive with a thousand different vector literals
+        and nothing else different: the same table, the same two projection
+        items, the same filter column, the same limit.  Everything the answer
+        needs beyond the literal -- which column holds the vectors, the column
+        headers, which projection item shows the distance, which columns have
+        to be read for the rows that survive -- is a property of that shape,
+        not of the query.  Resolving it again for every query is twenty odd
+        dictionary lookups and a name comparison per column, which measured as
+        thirteen microseconds of the ninety a query costs.
+
+        The plan is keyed by the statement shape the parser attaches to the
+        node.  A shape carries every name the statement mentions and drops the
+        vector literal, so two statements share a plan exactly when nothing
+        but the literal differs.  ``False`` marks a shape that the vectorised
+        path cannot serve, so the generic executor keeps it.
+        """
+
+        key = statement.get("shape")
+        if key is None:
+            # A statement the one-pass scanner did not build.  Its shape is
+            # built here, from the names only: a literal contributes its kind
+            # and not its text, so the key is a handful of tuples.
+            key = _shape_key(statement)
+        plans = table.fast_plans
+        plan = plans.get(key)
+        if plan is None:
+            plan = self._build_fast_plan(table, statement)
+            if len(plans) >= self._FAST_PLAN_LIMIT:
+                plans.clear()
+            plans[key] = False if plan is None else plan
+        return plan or None
+
+    def _build_fast_plan(self, table: Table, statement: dict):
+        """Resolve one statement shape, or ``None`` when the path cannot serve it."""
+
+        order = statement["order"]
+        limit = statement["limit"]
+        if len(order) != 1 or limit is None or order[0][1]:
+            return None
+        expression = order[0][0]
+        # Where the L2_DISTANCE node sits, and the item index the ORDER BY
+        # alias refers to (-1 when the ORDER BY holds the call itself).
+        node = None
+        item_index = -1
+        if expression[0] == "func" and expression[1] == "L2_DISTANCE":
+            node = expression
+        elif expression[0] == "col":
+            wanted = expression[1].lower()
+            for position, item in enumerate(statement["items"]):
+                alias = item["alias"]
+                if alias is None:
+                    alias = _default_alias(item["expr"])
+                if alias.lower() == wanted and item["expr"][0] == "func" \
+                        and item["expr"][1] == "L2_DISTANCE":
+                    node = item["expr"]
+                    item_index = position
+                    break
+        if node is None:
+            return None
+        args = node[2]
+        if not args or len(args) != 2:
+            return None
+        column_position = None
+        literal_at = -1
+        literal_is_text = False
+        for position, arg in enumerate(args):
+            if arg[0] == "col":
+                try:
+                    column = table.column(arg[1])
+                except SqlError:
+                    return None
+                if column.type != VECTOR:
+                    return None
+                column_position = table.column_index(arg[1])
+            elif arg[0] == "vec":
+                literal_at = position
+            elif arg[0] == "str":
+                literal_at = position
+                literal_is_text = True
+            else:
+                return None
+        if column_position is None or literal_at < 0:
+            return None
+        column = table.columns[column_position]
+        names, projections = self._select_projections(table, statement)
+        distance_shape = _shape(node)
+        is_distance = [_shape(expr) == distance_shape for expr, _alias in projections]
+        if sum(is_distance) != 1:
+            # Two projections that only differ in their literal would both be
+            # reported with the ordered distance; the generic path decides.
+            return None
+        plan = []
+        plain = True
+        for index, (expr, _alias) in enumerate(projections):
+            if is_distance[index]:
+                plan.append((_PROJECT_DISTANCE, 0))
+            elif expr[0] == "col":
+                position = table.column_index(expr[1])
+                plan.append((_PROJECT_COLUMN, position))
+                if table.columns[position].type == VECTOR:
+                    plain = False            # a vector is not JSON yet
+            else:
+                plan.append((_PROJECT_EXPRESSION, expr))
+                plain = False
+        key_position = -1
+        if table.primary_key is not None:
+            key_position = table.column_index(table.primary_key.name)
+        key_only = plain and all(
+            kind == _PROJECT_DISTANCE
+            or (kind == _PROJECT_COLUMN and reference == key_position)
+            for kind, reference in plan)
+        if not key_only:
+            # The columns a returned row has to be decoded from: everything the
+            # plan references, and nothing the distance already stands for.
+            columns = set()
+            for kind, reference in plan:
+                if kind == _PROJECT_COLUMN:
+                    columns.add(reference)
+                elif kind == _PROJECT_EXPRESSION:
+                    columns |= self._expression_columns(table, reference)
+            wanted = sorted(columns)
+        else:
+            wanted = []
+        return (column_position, column.dim, names, plan, plain, key_only,
+                wanted, key_position, item_index, literal_at, literal_is_text,
+                int(limit), int(statement.get("offset") or 0))
+
     def _fast_vector_select(self, table: Table, statement: dict) -> dict | None:
         """Vectorised path for a plain ``ORDER BY L2_DISTANCE(...) LIMIT k``.
 
@@ -888,49 +1064,45 @@ class Engine:
         executor keeps all of its behaviour.  The fast path stays out of the
         way while a transaction overlay is pending: the overlay decides which
         rows are visible and only the generic executor merges it.
+
+        The static half of the statement comes from :meth:`_fast_plan`; this
+        method only deals with the literal and with the rows.
         """
 
         if not fastpath.available() or self._overlay:
             return None
-        order = statement["order"]
-        limit = statement["limit"]
-        if len(order) != 1 or limit is None:
+        plan = self._fast_plan(table, statement)
+        if plan is None:
             return None
-        expression, descending = order[0]
-        if descending:
-            return None
-        target = self._distance_target(table, statement, expression)
-        if target is None:
-            return None
-        column_position, query_values, query_text = target
-        column = table.columns[column_position]
-        numpy = fastpath.module()
-        try:
-            if query_text is not None:
-                # numpy reads the literal in C; the reference converter walks
-                # the text in Python and is kept for every other shape, so an
-                # invalid literal still ends up on the path that raises.
-                query = fast_float32_text(query_text)
-                if query is None:
-                    query = to_float32_literal(query_text)
-            else:
-                query = to_float32(query_values)
-        except SqlError:
-            return None                      # invalid vector: generic path raises
-        if column.dim is None or len(query) != column.dim:
-            return None                      # the generic path raises the error
-
+        (column_position, column_dim, names, plan_items, plain, key_only,
+         wanted, key_position, item_index, literal_at, literal_is_text,
+         limit, offset) = plan
         store = table.store
         if store.has_nulls(column_position):
             return None                      # NULL vectors: generic path decides
-
-        names, projections = self._select_projections(table, statement)
-        if int(limit) <= 0:
+        if limit <= 0:
             return {"columns": names, "rows": []}
-        offset = int(statement.get("offset") or 0)
+        node = statement["items"][item_index]["expr"] if item_index >= 0 else \
+            statement["order"][0][0]
+        argument = node[2][literal_at][1]
+        numpy = fastpath.module()
+        if literal_is_text:
+            # numpy reads the literal in C; the reference converter walks the
+            # text in Python and is kept for every other shape, so an invalid
+            # literal still ends up on the path that raises.
+            query = fast_float32_text(argument)
+            if query is None:
+                try:
+                    query = to_float32_literal(argument)
+                except SqlError:
+                    return None              # invalid vector: generic path raises
+        else:
+            query = to_float32(argument)
+        if column_dim is None or len(query) != column_dim:
+            return None                      # the generic path raises the error
         query32 = _query_array(numpy, query)
         scanned = self._scan_topk(table, column_position, query32,
-                                  statement["where"], int(limit) + offset)
+                                  statement["where"], limit + offset)
         if scanned is None:
             return None
         slots = scanned[0]
@@ -942,16 +1114,12 @@ class Engine:
         # exactly the ones a pure-Python scan would have produced.  The
         # projection that shows the distance reuses that value instead of
         # computing it a second time.
-        distance_expression = self._distance_expression(statement, expression)
-        # Only the columns the projection uses are read from the store; the
-        # vector column comes from the matrix the scan already holds.
-        wanted = self._projection_columns(table, projections, distance_expression)
         # The vector column is read in its stored precision: widening the
         # candidates that survive is a few rows, not the whole column.
         view = self._view(store, column_position)
         matrix = None if view is None else view[0]
         keys = store.primary_keys() if view is None else view[2]
-        query64 = _query_array(numpy, query).astype(numpy.float64)
+        query64 = query32.astype(numpy.float64)
         if matrix is not None:
             # The candidate vectors are taken in one numpy call; asking for one
             # row at a time costs more than the scan itself.  The distance of
@@ -976,41 +1144,23 @@ class Engine:
             known = keys[slots].tolist()
             order = sorted(range(slots.size),
                            key=lambda index: (exact[index], known[index]))
-        chosen = order[offset:offset + int(limit)]
-        # The projection is the same for every returned row, so the shape of
-        # each item is resolved once instead of ten times: a distance, a
-        # column read straight out of the row, or an expression to evaluate.
-        plan = []
-        plain = True
-        for expr, _alias in projections:
-            if distance_expression is not None and expr == distance_expression:
-                plan.append((_PROJECT_DISTANCE, 0))
-            elif expr[0] == "col":
-                position = table.column_index(expr[1])
-                plan.append((_PROJECT_COLUMN, position))
-                if table.columns[position].type == VECTOR:
-                    plain = False            # a vector is not JSON yet
-            else:
-                plan.append((_PROJECT_EXPRESSION, expr))
-                plain = False
-        # A projection of just the primary key and the distance needs nothing
-        # from the data files: the key is already in the mapped key column and
-        # the distance is the value the exact stage produced.  Reading the rows
-        # instead costs a system call per column per query.
-        key_position = None
-        if table.primary_key is not None:
-            key_position = table.column_index(table.primary_key.name)
-        key_only = plain and all(
-            kind == _PROJECT_DISTANCE
-            or (kind == _PROJECT_COLUMN and reference == key_position)
-            for kind, reference in plan)
+        chosen = order[offset:offset + limit]
         if key_only:
             known_keys = keys[slots[chosen]].tolist()
             distances = [float(exact[index]) for index in chosen]
+            if len(plan_items) == 1:
+                if plan_items[0][0] == _PROJECT_DISTANCE:
+                    return {"columns": names, "rows": [[d] for d in distances]}
+                return {"columns": names, "rows": [[k] for k in known_keys]}
+            if (len(plan_items) == 2 and plan_items[0][0] == _PROJECT_COLUMN
+                    and plan_items[1][0] == _PROJECT_DISTANCE):
+                return {"columns": names,
+                        "rows": [[known_keys[row], distances[row]]
+                                 for row in range(len(distances))]}
             output = []
             for row in range(len(distances)):
                 output.append([known_keys[row] if kind == _PROJECT_COLUMN
-                               else distances[row] for kind, _ in plan])
+                               else distances[row] for kind, _ in plan_items])
             return {"columns": names, "rows": output}
         # Only the rows that are really returned are decoded and projected;
         # reading every candidate would do four times the work of the answer.
@@ -1025,7 +1175,7 @@ class Engine:
                 distance = float(exact[index])
                 source = rows[row]
                 values = []
-                for kind, reference in plan:
+                for kind, reference in plan_items:
                     if kind == _PROJECT_COLUMN:
                         values.append(source[reference])
                     else:
@@ -1035,7 +1185,7 @@ class Engine:
         for row, index in enumerate(chosen):
             distance = float(exact[index])
             values = []
-            for kind, reference in plan:
+            for kind, reference in plan_items:
                 if kind == _PROJECT_DISTANCE:
                     values.append(distance)
                 elif kind == _PROJECT_COLUMN:
@@ -1103,6 +1253,12 @@ class Engine:
         matrix = store.fixed_column_array(position)
         if matrix is None:
             return None
+        # A mapped column is a ``memmap`` instance, and every index and every
+        # product on it runs through the subclass' Python hooks, one call per
+        # array.  ``asarray`` keeps the same buffer and drops the subclass, so
+        # the scan sees a plain ``ndarray`` without copying the column.
+        if type(matrix) is not fastpath.module().ndarray:
+            matrix = fastpath.module().asarray(matrix)
         norms = store.vector_norms32(position)
         keys = store.primary_keys()
         if norms is None or keys is None:
@@ -1176,18 +1332,18 @@ class Engine:
         if not all_live:
             live = store.live_mask()
         if entry is not None:
-            ids, block, block_norms = entry
+            ids, block, block_norms, block_pks = entry
         else:
             mask = self._fast_filter_block(table, where, 0, total)
             if mask is None:
                 return None
             ids = numpy.flatnonzero(mask if live is None else mask & live)
-            block = block_norms = None
+            block = block_norms = block_pks = None
             if entries is not None:
                 if len(entries) >= 64:
                     entries.clear()           # a plan that keeps changing
                     usage[0] = 0
-                entries[where] = (ids, None, None)
+                entries[where] = (ids, None, None, None)
         if ids.size == 0:
             return (numpy.empty(0, dtype=numpy.intp),
                     numpy.empty(0, dtype=numpy.float32))
@@ -1198,6 +1354,7 @@ class Engine:
             if block is None:
                 block = numpy.ascontiguousarray(matrix[ids])
                 block_norms = norms[ids]
+                block_pks = pks[ids]
                 if entries is not None:
                     # The copies are bounded: a clause that keeps a large part
                     # of the table would otherwise repeat the column in memory
@@ -1205,10 +1362,10 @@ class Engine:
                     if usage[0] + block.nbytes > self.FILTER_BLOCK_BYTES:
                         entries.clear()
                         usage[0] = 0
-                    entries[where] = (ids, block, block_norms)
+                    entries[where] = (ids, block, block_norms, block_pks)
                     usage[0] += block.nbytes
             return self._topk(numpy, block, block_norms, ids, pks, take,
-                              query32)
+                              query32, block_pks)
         distances = self._distances(numpy, matrix, norms, query32)
         if ids.size == total:
             return self._select(numpy, distances, pks, None, take)
@@ -1298,11 +1455,12 @@ class Engine:
         return squared
 
     def _topk(self, numpy: Any, rows: Any, row_norms: Any, slot_ids: Any,
-              pks: Any, take: int, query32: Any):
+              pks: Any, take: int, query32: Any, row_keys: Any = None):
         distances = self._distances(numpy, rows, row_norms, query32)
-        return self._select(numpy, distances, pks, slot_ids, take)
+        return self._select(numpy, distances, pks, slot_ids, take, row_keys)
 
-    def _select(self, numpy: Any, distances: Any, pks: Any, slot_ids: Any, take: int):
+    def _select(self, numpy: Any, distances: Any, pks: Any, slot_ids: Any, take: int,
+                row_keys: Any = None):
         """The ``take`` closest candidates, as ``(slots, distances)`` arrays.
 
         Only the boundary distance is needed from the selection, and the rows
@@ -1330,7 +1488,7 @@ class Engine:
                     numpy.empty(0, dtype=distances.dtype))
         tolerance = self.SCAN_TOLERANCE
         narrowed = None
-        if n >= 4 * take:
+        if n >= 4 * take and n > 4096:
             # One row in ``step`` is sampled, and the rank that leaves about
             # sixteen times ``take`` rows below the threshold is taken from
             # it: the subset has to hold the whole tolerance band around the
@@ -1343,7 +1501,21 @@ class Engine:
                 rows = numpy.flatnonzero(distances <= threshold)
                 if take <= rows.size <= n // 2:
                     narrowed = rows
-        if narrowed is None:
+        if narrowed is None and 4 * take <= n and n > take:
+            # A short column does not repay the sample.  One argpartition of a
+            # thousand values is cheaper than narrowing it first, and its
+            # ``take + 1``-th value answers a second question for free: how far
+            # the nearest rejected row is.  When that gap is wider than the
+            # tolerance, no row can tie with the boundary and the pass that
+            # recovers the band around it is not taken at all.
+            order = numpy.argpartition(distances, take)
+            nearest = order[:take]
+            boundary = float(distances[order[take - 1]])
+            if float(distances[order[take]]) - boundary > tolerance:
+                return (nearest if slot_ids is None else slot_ids[nearest],
+                        distances[nearest])
+            candidates = numpy.flatnonzero(distances <= boundary + tolerance)
+        elif narrowed is None:
             boundary = float(numpy.partition(distances, take - 1)[take - 1])
             candidates = numpy.flatnonzero(distances <= boundary + tolerance)
         else:
@@ -1357,7 +1529,10 @@ class Engine:
             keep = subset <= boundary + tolerance
             candidates = narrowed if bool(keep.all()) else narrowed[keep]
         if candidates.size > take:
-            keys = pks if slot_ids is None else pks[slot_ids]
+            if row_keys is not None:
+                keys = row_keys
+            else:
+                keys = pks if slot_ids is None else pks[slot_ids]
             order = numpy.lexsort((keys[candidates], distances[candidates]))
             candidates = candidates[order][:take]
         slots = candidates if slot_ids is None else slot_ids[candidates]

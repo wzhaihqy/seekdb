@@ -805,6 +805,12 @@ def fast_topk(sql: str) -> dict | None:
             return None
     return {
         "kind": "select",
+        # Everything the statement mentions except the vector literal: the
+        # executor resolves the projection, the filter column and the limit
+        # once per shape and reuses that for every query that repeats it.
+        "shape": ("topk", table.lower(), key.lower(), vector.lower(), alias.lower(),
+                  None if where_key is None else where_key.lower(), order.lower(),
+                  int(limit)),
         "items": [{"expr": ("col", key), "alias": None},
                   {"expr": ("func", "L2_DISTANCE",
                             [("col", vector), ("str", text)]),

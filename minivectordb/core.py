@@ -283,7 +283,15 @@ def fast_float32_text(text: str):
         return None
     if values.ndim != 1 or values.size == 0:
         return None
-    if not bool(_np.isfinite(values).all()):
+    # A NaN in the literal makes the total NaN, and an infinity makes it
+    # infinite, so one reduction rejects both.  It is a coarser test than
+    # ``isfinite(...).all()`` -- a literal whose elements are finite but whose
+    # sum overflows is rejected too -- and that direction is the safe one: the
+    # literal then goes to the reference converter, which reads it exactly and
+    # either accepts it or raises what it always raised.  It is also two
+    # microseconds cheaper on every query, which is the point.
+    total = float(values.sum(dtype=_np.float64))
+    if not -1e308 < total < 1e308:
         return None
     return values
 
