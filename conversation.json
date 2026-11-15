@@ -947,6 +947,10 @@
       {
        "pointer": "/experiments/42/result",
        "quote": "桩服务 p50 16.5 us、均值 23.5 us，比记录的 162 us 小 7 倍；真服务上客户端六段合计 60.3 us、唤醒 18.5 us、引擎 203.7 us。按新地板重算，「引擎零成本」的极限是 q=117 us、E≈3780。"
+      },
+      {
+       "pointer": "/experiments/31/conclusion",
+       "quote": "地板是决策依据而不是借口：它把「做一个更快的索引」这个方向直接否掉，并把后续工作限定在「压缩固定开销 + 压低扫描字节数」两条线上。"
       }
      ],
      "verification": "桩服务 p50 16.5 us、均值 23.5 us，而记录里写的是 162 us；真服务上客户端六段合计 60.3 us、唤醒 18.5 us。天花板从 E≈2430 重算为 q≈117 us、E≈3780。",
@@ -964,6 +968,10 @@
       {
        "pointer": "/experiments/47/result",
        "quote": "机器是 10 个 Cortex-X925（3.9 GHz，capacity 997-1024）+ 10 个 Cortex-A725（2.8 GHz，capacity 718-731），capability 差 40%。调度自由 0.281 ms、p90 是 p50 的 2.1 倍；钉两个大核 0.150 ms、p90 是 p50 的 1.08 倍。1.87 倍，且尾巴消失。"
+      },
+      {
+       "pointer": "/experiments/32/conclusion",
+       "quote": "profiler 只用来看「占比排序」，绝对时间一律用无 profiler 的多轮中位数。这条直接推翻了我此前「写入比基线慢 17%」的判断。"
       }
      ],
      "verification": "调度自由 0.281 ms、p90 是 p50 的 2.1 倍；钉两个大核 0.150 ms、p90/p50 降到 1.08。上一轮「34% 的均值/p50 差来自 GC」的解释因此作废。",
@@ -1013,6 +1021,10 @@
       {
        "pointer": "/conversations/1/content",
        "quote": "PowerShell 5.1 需要 UTF-8 BOM 才能正确解析中文脚本，我补上再跑。」 「脚本有三处 bug（$Args 撞自动变量、Detail 拼接、WSL 未安装误判）。"
+      },
+      {
+       "pointer": "/experiments/44/conclusion",
+       "quote": "报错说「盘满」而 df 说有空，是器材在说谎；判据应当是「它写到哪个目录」，不是错误码。"
       }
      ],
      "verification": "每修一处就跑一次同一脚本，直到能起判题进程；失败的尝试没有删，全部留在记录里。",
