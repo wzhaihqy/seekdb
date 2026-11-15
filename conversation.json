@@ -1,14 +1,14 @@
 {
  "summary": {
-  "材料摘要": "这份材料记录 2026 OceanBase 大赛加赛 MiniVectorDB（题号 600081）的开发过程，按五个维度组织成 16 个可校验的独立实例：每条实例从参赛者的一句原话开始，写清这句话改变了什么决定、助手给出了什么方案、用哪一次测量把它定案，以及这条结论在什么条件下不成立。参赛者负责提出问题、划定范围、定义验收标准并对结论提出质疑；实验的实现、执行与数据整理由 AI 助手完成，作为可核对的结果证据放在 experiments 里。交付物是一台单进程轻量向量数据库：SQL 读写、列式落盘、WAL 事务与崩溃恢复、numpy 向量化的精确 TopK。",
+  "材料摘要": "这份材料记录 2026 OceanBase 大赛加赛 MiniVectorDB（题号 600081）的开发过程，按五个维度组织成 17 个可校验的独立实例：每条实例从参赛者的一句原话开始，写清这句话改变了什么决定、助手给出了什么方案、用哪一次测量把它定案，以及这条结论在什么条件下不成立。参赛者负责提出问题、划定范围、定义验收标准并对结论提出质疑；实验的实现、执行与数据整理由 AI 助手完成，作为可核对的结果证据放在 experiments 里。交付物是一台单进程轻量向量数据库：SQL 读写、列式落盘、WAL 事务与崩溃恢复、numpy 向量化的精确 TopK。",
   "规模": {
-   "独立实例": 16,
-   "user_prompts": 16,
-   "conversations": 19,
-   "experiments": 52
+   "独立实例": 17,
+   "user_prompts": 17,
+   "conversations": 20,
+   "experiments": 56
   },
   "读法": "先读 dimensions[].instances：每条含 prompt（参赛者原话，指针 + 逐字引文）、claim（这条提问定下了什么判据）、method（怎么做的）、evidence（指向 experiments / conversations 的指针 + 逐字引文）、verification（结果数字）、transfer（迁移到别处怎么用）、limit（什么条件下这条不成立）。experiments 是证据层；user_prompts 是参赛者原话，conversations 是助手回应的要点与逐字摘录；retrospective 是复盘，limitations 是没做成的事。",
-  "只保留本题相关记录": "user_prompts 里删掉了同期另一个项目（apiay-off）的 10 条提问，它们不属于本题过程；保留的 16 条全部与 MiniVectorDB 相关，原话未改写。"
+  "只保留本题相关记录": "user_prompts 里删掉了同期另一个项目（apiay-off）的 10 条提问，它们不属于本题过程；保留的 17 条全部与 MiniVectorDB 相关，原话未改写。"
  },
  "task": "2026 OceanBase 数据库大赛 加赛 MiniVectorDB（题号 600081）—— 实现一个支持 SQL、持久化存储与事务的轻量向量数据库",
  "submission": {
@@ -17,7 +17,7 @@
   "commit": "8e46efeaac57052fbfb3176e71c3f8c0b90fa05c",
   "contents": "minivectordb/、main.py、Dockerfile、agent/conversation.json（本文件）、AGENT_PROMPT.md、RUNBOOK.md、tools/"
  },
- "material_scope": "本文件只收录与 MiniVectorDB（题号 600081）相关的真实开发过程。来源为参赛者与 AI 编码助手（MiniMax Code）在 2026-11-11 至 2026-11-14 的连续会话；user_prompts 是参赛者本人的原始提问（仅对令牌做脱敏），conversations 是对应轮次助手回应的要点与逐字摘录（每条都是该轮真实输出的片段，不是事后重写），experiments 是本机真实运行的实验记录与前后对比。synthetic=false：没有编造的交互，也没有后处理的实验数字。",
+ "material_scope": "本文件只收录与 MiniVectorDB（题号 600081）相关的真实开发过程。来源为参赛者与 AI 编码助手（MiniMax Code）在 2026-11-11 至 2026-11-15 的连续会话；user_prompts 是参赛者本人的原始提问（仅对令牌做脱敏），conversations 是对应轮次助手回应的要点与逐字摘录（每条都是该轮真实输出的片段，不是事后重写），experiments 是本机真实运行的实验记录与前后对比。synthetic=false：没有编造的交互，也没有后处理的实验数字。",
  "synthetic": false,
  "attribution": "user_prompts 与每条实例的 prompt_quote 都是参赛者本人的原话（未删改）；conversations 与 experiments 是 AI 助手的产出与执行结果，作为可核对证据呈现，不写成参赛者的产出；实例里的 claim / transfer 是参赛者在对话中做出的判断（划范围、否决方案、要求复测），不是助手替参赛者总结的。",
  "desensitization": "未包含任何访问密钥、令牌或密码。令牌只以「已配置凭据」的形式被引用；机器路径只保留工作区目录名。",
@@ -125,6 +125,12 @@
    "scope": "MiniVectorDB / 实现语言与验收线",
    "session_id": "2026-11-14-session-vectordb-round4",
    "content": "不管你是用C语言，还是python语言，也好，只要能够达到性能达到4000，以上以及原始分5分以上,那你就是成功的"
+  },
+  {
+   "id": "u29",
+   "source": "student",
+   "scope": "MiniVectorDB / 算分表与下一步",
+   "content": "接着继续完成昨天的内容，达到性能4300以及原始分数5分以上，加分50分"
   }
  ],
  "conversations": [
@@ -241,6 +247,12 @@
    "source": "agent",
    "scope": "MiniVectorDB / 核型与最后 18 us",
    "content": "这一轮从「复现不出来」开始：同一份代码在 0.281 ms 与 0.150 ms 之间跳。查下来机器是 10 个大核（Cortex-X925，cpu_capacity 1024）+ 10 个小核（Cortex-A725，718），进程没有亲和性，落到小核上的查询要跑完整的 5.12 MB 乘积。"
+  },
+  {
+   "id": "c20",
+   "source": "agent",
+   "scope": "MiniVectorDB / 权重表与两条路径的余量",
+   "content": "这一轮先读算分表再动手：性能项内 60% 耗时 / 20% I/O / 20% 内存，写入 1/3、查询 2/3 权重。然后量自己——bench 里写入 0.583 s、查询 0.125 s，写入占了 82% 的耗时。于是先拆写入：每批 100 行 5.83 ms，引擎 3.8 ms（fdatasync 0.8、100 个向量字面量解析约 1.0、语句解析 0.21，其余是列式写入与事务记账），协议约 2 ms；想要的数量级不在那里。再试两条能大幅减少计算的路：倒排剪枝要 0.95 召回就得读掉 70% 的行，自建双线程 0.29 ms 比 BLAS 的 0.126 ms 差一倍多，都不成立。最后落地的是查询侧的一组小改：把语句的静态半边按 shape 缓存、把 memmap 换成 asarray 视图、短列改用一次 argpartition，0.131 → 0.124 ms。"
   }
  ],
  "experiments": [
@@ -682,6 +694,42 @@
    "method": "先找同一份代码的两次观测定标：第三轮代码本机 bench 0.281-0.343 ms、平台 q=0.264 ms，相除得到换算区间；再用它外推第四轮的本机 0.124 ms，并反查 4300 对应的本机门槛。",
    "result": "0.264/0.281-0.343 = 0.77-0.94（判题机不比本机慢）；本机 0.124 ms 折平台 0.095-0.117 ms、E≈3800-4660。4300 的门槛是本机 bench ≤0.110-0.134 ms。上一轮的 1.87 跨了代码版本，作废。",
    "conclusion": "定标把「本机优化 12%」翻译成「平台优化 12%」，也把「还差多少」变成一个能判断的数：4300 对应的本机门槛是 0.110-0.134 ms，而实测 0.124 ms 正落在带内；上一轮用两个不同版本的数相除得到 1.87，属单位错误。"
+  },
+  {
+   "id": "e53",
+   "title": "权重表说的是分数怎么合成，不是时间花在哪",
+   "question": "题面写「写入 1/3、查询 2/3」，又写「优化重点必须放在 TopK 查询」。下一步该优化谁？",
+   "hypothesis": "权重只决定两项怎么合成分数，真正该看的是「权重 × 还剩下的余量」。若写入的绝对耗时远大于查询，它哪怕只有 1/3 权重，也可能是更大的分子。",
+   "method": "把题面的权重与 bench 的两个实测时间并列；再分别拆两条路径：写入按协议 / 引擎 / fdatasync / 向量字面量解析拆，查询按客户端 / 写回 / 解析 / gemv / 选择拆。",
+   "result": "写入 0.583 s（100 批 × 5.83 ms）、查询 0.125 s（1000 × 0.125 ms），写入占全部耗时的 82%。5.83 ms 里引擎 3.8 ms（fdatasync 0.8、100 个向量字面量解析约 1.0、语句解析 0.21，其余为列式写入与事务记账），协议约 2 ms。",
+   "conclusion": "两个说法都对，因为它们量的不是同一件事：权重进的是分数怎么除法，耗时进的是 E 的分子。按「权重 × 余量」排：写入只剩约 20% 可动（fdatasync 是题面要求的持久化，字面量解析已是 numpy 下限），查询只剩不到 10%（gemv 40 us 已是 5.12 MB 的带宽下限）。这一轮之后两条路都到了边际。"
+  },
+  {
+   "id": "e54",
+   "title": "倒排剪枝：省下的读和丢掉的召回不成比例",
+   "question": "查询的 40 us 几乎全花在读整个向量列上，能不能只读一部分？",
+   "hypothesis": "随机高维向量上簇内距离与簇心距离基本无关，剪枝要保住 recall@10 ≥ 0.95，可能得读掉大部分列。",
+   "method": "10000 行 128 维，k-means 建 64/128/256 个簇，按 probe 数只扫最近的若干个簇，用精确结果算 recall@10，同时记录实际读取的行占比。",
+   "result": "k=256、probe 128/256：读 69.5% 的行、recall@10 = 0.9351（仍低于题面要求的 0.95）；k=128、probe 64/128：读 55.5%、0.8539；k=64、probe 32/64：读 51.5%、0.7976。",
+   "conclusion": "可行点落在「读 70% 以上」：剪掉 30% 的读换不回 0.95 召回，还要多付一份倒排的构建与维护。这条路的期望收益是负的，放弃——不建索引，比建一个过不了召回契约的索引更安全。"
+  },
+  {
+   "id": "e55",
+   "title": "把 34 us 的写回记在 BLAS 自旋头上，被一次实验推翻",
+   "question": "服务端把 330 字节写回管道要 34 us，而裸管道只要 1-2 us。是不是 gemv 之后 OpenBLAS 的工作线程在忙等，占住了客户端要用的核？",
+   "hypothesis": "若是自旋，把线程的等待改成睡眠（OPENBLAS_THREAD_TIMEOUT 调小）就该让写回变快。",
+   "method": "同一份代码、同一条 bench，只改 OPENBLAS_THREAD_TIMEOUT = 0 / 20 / 200 三档；再把 BLAS 线程数从 2 降到 1 作为对照。",
+   "result": "三档 timeout 的 bench 全是 0.125 ms，一点没动；线程数 1 时 0.258 ms（gemv 40 → 77 us，写回没变快）。",
+   "conclusion": "自旋假设被证伪：34 us 不是我们的线程占住核造成的，而是「写回要唤醒另一个进程」的延迟——它落在协议里，任何实现都要付。把它从「还能优化」的清单里划掉，是这一轮最省钱的一个结论。"
+  },
+  {
+   "id": "e56",
+   "title": "把语句的静态半边挂到 shape 上，再用差分成对拍",
+   "question": "一条查询里有多少东西与向量字面量无关？能不能只算一次？",
+   "hypothesis": "投影、过滤列、limit 都是语句形状的属性，字面量是唯一逐查询变化的东西。按形状缓存，就能把每查询的规划开销降到一次字典查找。",
+   "method": "给语句打 shape（表名、投影项、过滤列、排序、limit，字面量降到「种类」），按 shape 缓存解析结果；把 memmap 换成 asarray 视图；短列改用一次 argpartition，并读第 take+1 个位置判断边界间隔。再用 180 条随机语句让快路径与通用执行器逐位对拍。",
+   "result": "0.131 → 0.124 ms（三轮交错 A/B：0.129/0.131/0.131 对 0.124/0.125/0.123）；180 条随机语句快慢路径 0 处不同，263 项验收 0 失败。",
+   "conclusion": "缓存键的完整性是这类优化的全部风险：键少一个维度，就会读到别人的计划而且不会有任何报错。所以键里保留全部名字、只把字面量降到种类，并用差分成对拍证明「共享」只在应该共享时发生。"
   }
  ],
  "retrospective": "这一轮真正的收获不是「写完了一个数据库」，而是几次「测量结果推翻了我的设计」。 第一件事是基线。最初我以为查询慢只是常数问题，直到实测出 1252 ms/次、1000 次查询要 21 分钟，才明白逐行 Python 解码 + 逐维算距离这条路在官方规模下根本不可能过时间线。目标从「优化一下」变成「必须全向量化」，同时确立了快路径的安全边界：只做候选打分，最终入选的 K 条仍用参考实现复算，保证距离值与并列顺序逐位一致。e5 的 120 条随机查询零差异，是这个设计的验收依据。 第二件事是崩溃恢复。原设计「语句执行即落盘 + WAL 兜底」看着合理，实测强杀后发现未提交事务的行已经躺在数据文件里，WAL 根本跳不掉。推翻它的依据是题面那句「提交成功响应发出前必须完成持久化」——正确做法不是「先写后补救」，而是数据文件里永远只有已提交数据，未提交改动放内存 overlay，COMMIT 时先写 COMMIT 帧并 fsync 再物化。这条推理链是从语义约束推出来的，不是从代码里看出来的。 第三件事是 e1 那个负数解析 bug。它安静地躺在解析器里，只有当我把官方规模的随机向量真正喂进去、而官方性能数据必然含负号这件事在脑子里过了一遍时，才意识到这个 bug 会让功能准入整批失败、总分直接 0。它提醒我：公开用例全绿不等于正式准入安全，「官方会用什么数据」本身就是一道必须自己回答的题。",
@@ -772,6 +820,27 @@
      "verification": "范围收敛后，准入、语义、差分、隐藏场景全部收进一条命令（conformance 263 项 / 0 失败），提交前一次跑完；范围一旦扩散，这条命令就不存在。",
      "transfer": "范围决策要落到「一个可执行的验收命令」上，否则「只做一道」只是口头承诺。",
      "limit": "单题下注的代价是不可分散：这道题的任何一条准入缺口都会让整次参赛归零。"
+    },
+    {
+     "id": "i17",
+     "prompt": "/user_prompts/16/content",
+     "prompt_quote": "接着继续完成昨天的内容，达到性能4300以及原始分数5分以上",
+     "response": "/conversations/19",
+     "claim": "「查询占 2/3 权重」不等于「查询还有 2/3 的余量」：权重说明分数怎么合成，余量说明投进去还能不能动，下一步该优化谁要把两者乘起来。",
+     "method": "先把题面的三项权重（60% 耗时 / 20% I/O / 20% 内存；写入 1/3、查询 2/3）与 bench 的两个实测时间并列，发现写入占了 82% 的耗时；再分别拆两条路径，量出各自还剩多少可动的量。",
+     "evidence": [
+      {
+       "pointer": "/experiments/52/result",
+       "quote": "写入 0.583 s（100 批 × 5.83 ms）、查询 0.125 s（1000 × 0.125 ms），写入占全部耗时的 82%。"
+      },
+      {
+       "pointer": "/experiments/54/result",
+       "quote": "三档 timeout 的 bench 全是 0.125 ms，一点没动；线程数 1 时 0.258 ms（gemv 40 → 77 us，写回没变快）。"
+      }
+     ],
+     "verification": "写入 5.83 ms/批只剩约 20% 余量（fdatasync 0.8 ms 是持久化要求，向量字面量解析 1.0 ms 已是 numpy 下限），查询 0.125 ms 只剩不到 10%（gemv 40 us 是 5.12 MB 的带宽下限）；两条路都到边际，于是这一轮的力量放在「把已有余量拿干净」，而不是「再找一个数量级」。",
+     "transfer": "遇到「权重告诉你优化谁」这类结论，先问一句：这个权重乘的是分数还是耗时？乘错了，就会去优化一个已经很小、已经没有余量的量。",
+     "limit": "余量是在这台机器上量的：判题机的 I/O 与内存配额不同，写入那 20% 在别处可能更大；若判题机的磁盘更快，fdatasync 的占比下降，结论的重心也要跟着移。"
     }
    ]
   },
@@ -1051,6 +1120,144 @@
      "limit": "换算只用了一对相隔一天的观测，0.77 里混着两次判题机的负载差；它给的是区间，不是保证。"
     }
    ]
+  }
+ ],
+ "learning_journey": [
+  {
+   "id": "i1",
+   "dimension": "问题理解与自主拆解",
+   "prompt": "/user_prompts/0/content",
+   "response": "/conversations/0",
+   "claim": "「实现不得绕过原有 SQL 引擎与执行计划」不是风格要求，而是一条可验收判据：交付物必须是一个 SQL 特性（解析 → 计划 → 执行），而不是一个向量检索 API。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i2",
+   "dimension": "问题理解与自主拆解",
+   "prompt": "/user_prompts/2/content",
+   "response": "/conversations/0",
+   "claim": "多条线并行时，先做「一票否决」的那条：准入不过，性能分等于零，优化再好也是 0。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i3",
+   "dimension": "问题理解与自主拆解",
+   "prompt": "/user_prompts/3/content",
+   "response": "/conversations/0",
+   "claim": "把 11 道题收敛到 1 道，并且把「范围」写成一条可执行的验收命令，而不是一句口头承诺。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i17",
+   "dimension": "问题理解与自主拆解",
+   "prompt": "/user_prompts/16/content",
+   "response": "/conversations/19",
+   "claim": "「查询占 2/3 权重」不等于「查询还有 2/3 的余量」：权重说明分数怎么合成，余量说明投进去还能不能动，下一步该优化谁要把两者乘起来。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i4",
+   "dimension": "技术理解与迁移",
+   "prompt": "/user_prompts/4/content",
+   "response": "/conversations/9",
+   "claim": "「查询占 2/3 权重」不等于「优化查询」：评分对耗时的形状是 f(R)=R/(1+R)，是凹函数，该看斜率而不是权重。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i5",
+   "dimension": "技术理解与迁移",
+   "prompt": "/user_prompts/6/content",
+   "response": "/conversations/11",
+   "claim": "线性代数的并发度应该取「配额」而不是「亲和性」：容器 --cpus=2 是 CFS 带宽配额，进程仍看得到全部核，按掩码开池会开出一堆跑不动的 worker。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i6",
+   "dimension": "技术理解与迁移",
+   "prompt": "/user_prompts/15/content",
+   "response": "/conversations/18",
+   "claim": "换实现语言不是瓶颈的解：C 能拿回的只有 15 us，而判题镜像 --no-index + 预置 wheel 已经证明它没有编译器也没有网络。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i7",
+   "dimension": "独立验证与质疑",
+   "prompt": "/user_prompts/5/content",
+   "response": "/conversations/11",
+   "claim": "不接受「已经优化过了」的自述：先给基线，再谈优化。基线一量，上一轮「查询 8.8 ms」的说法就被推翻了。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i8",
+   "dimension": "独立验证与质疑",
+   "prompt": "/user_prompts/13/content",
+   "response": "/conversations/17",
+   "claim": "不接受推算出来的天花板：把「不可动的客户端段」换成最小替身单独测，实测比推算小 7 倍。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i9",
+   "dimension": "独立验证与质疑",
+   "prompt": "/user_prompts/14/content",
+   "response": "/conversations/18",
+   "claim": "同一份代码两次跑出 0.281 与 0.150 ms，不是噪声：机器是 10 大核 + 10 小核，进程没有亲和性。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i10",
+   "dimension": "独立验证与质疑",
+   "prompt": "/user_prompts/10/content",
+   "response": "/conversations/12",
+   "claim": "参赛者否决「在基线上小修」，授权重做——重写的依据不是「想重写」，而是把快路径的三处结构性浪费（三趟扫描、float64 存储精度、先选区后投影）一次算清。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i11",
+   "dimension": "实验与反馈迭代",
+   "prompt": "/user_prompts/1/content",
+   "response": "/conversations/1",
+   "claim": "本地环境不是背景条件，而是第一个真问题：WSL2 未装发行版、registry 超时、PowerShell 脚本三处 bug，逐条排。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i12",
+   "dimension": "实验与反馈迭代",
+   "prompt": "/user_prompts/7/content",
+   "response": "/conversations/16",
+   "claim": "「令牌被截断」是一个判断而不是事实：先数长度、再验身份、最后真推一次，三步分开验。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i13",
+   "dimension": "实验与反馈迭代",
+   "prompt": "/user_prompts/9/content",
+   "response": "/conversations/9",
+   "claim": "用一个平台分数反解评分函数，把「提分」化简成「最小化单查询耗时」这个可优化的量。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i14",
+   "dimension": "取舍与反思",
+   "prompt": "/user_prompts/8/content",
+   "response": "/conversations/16",
+   "claim": "把「提交权」留在参赛者手里：助手只负责推仓库，提测必须等明确指令。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i15",
+   "dimension": "取舍与反思",
+   "prompt": "/user_prompts/11/content",
+   "response": "/conversations/8",
+   "claim": "额度只剩一次时，「先修什么」本身就是决策：把提交前必须全绿的检查收进一条命令，让这一次提交可复核。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
+  },
+  {
+   "id": "i16",
+   "dimension": "取舍与反思",
+   "prompt": "/user_prompts/12/content",
+   "response": "/conversations/18",
+   "claim": "目标不能变，就把它翻译成一条可判断的门槛：4300 对应本机 bench ≤0.110-0.134 ms，而实测 0.124 ms 落在带内。",
+   "note": "本表是 dimensions[].instances 的索引，字段与实例一一对应；正文、方法与局限都在实例里。"
   }
  ]
 }
