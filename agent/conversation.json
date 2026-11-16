@@ -19,85 +19,93 @@
      "id": "i1",
      "prompt": "/user_prompts/0/content",
      "prompt_quote": "不得绕过 seekdb 原有 SQL 引擎与执行计划，不得针对输入硬编码，且必须保证高并发下的稳定性与事务一致性。请结合上述原则，为这道题拆解技术实现路径。",
-     "response": "/conversations/0",
+     "response": "/conversations/0/content",
      "claim": "「实现不得绕过原有 SQL 引擎与执行计划」不是风格要求，而是一条可验收判据：交付物必须是一个 SQL 特性（解析 → 计划 → 执行），而不是一个向量检索 API。",
      "method": "先把题面三条原则逐条翻译成工程判据，再决定代码落在哪一层：SQL 层、存储层、还是进程外壳。",
-     "evidence": [
+     "verification": "66 条 SQL 准入语句 + 263 项断言全过；隐藏用例（非法向量、超内存、重复恢复）逐条写成可执行断言，不再是「应该没问题」。",
+     "transfer": "任何合规/审计类需求都可以先落成断言，再让断言驱动实现；判据先行，实现后到。",
+     "limit": "判据是从题面文字推出来的，如果评审对「SQL 特性」另有解释，这条推理会偏——本地无法验证评审口径。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/0/content",
+       "quote": "你是一名深耕 OceanBase 与 C++ 数据库内核的资深架构师。我当前正在参加 2026 OceanBase 大赛的 seekdb 赛道帮我完成这12道赛题。 该赛题明确要求：实现不得绕过 seekdb 原有 SQL 引擎与执行计划，不得针对输入硬编码，且必须保证高并发下的稳定性与事务一致性。请结合上述原则，为这道题拆解技术实现路径。"
+      }
+     ],
+     "result_evidence": [
       {
        "pointer": "/experiments/3/conclusion",
        "quote": "公开用例 20/20 通过（判定用的是官方原码，不是自写评分）。公开用例通过不等于正式 29 用例准入通过，正式准入仍需在 Linux 容器里跑。"
-      },
-      {
-       "pointer": "/experiments/16/conclusion",
-       "quote": "随机对拍是这次最有价值的手段：优化快路径时它两次抓出真实缺陷（缓冲区形状不匹配导致快路径直接报错、以及并列行的选择顺序问题），靠人工读代码很难发现。"
       }
-     ],
-     "verification": "66 条 SQL 准入语句 + 263 项断言全过；隐藏用例（非法向量、超内存、重复恢复）逐条写成可执行断言，不再是「应该没问题」。",
-     "transfer": "任何合规/审计类需求都可以先落成断言，再让断言驱动实现；判据先行，实现后到。",
-     "limit": "判据是从题面文字推出来的，如果评审对「SQL 特性」另有解释，这条推理会偏——本地无法验证评审口径。"
+     ]
     },
     {
      "id": "i2",
      "prompt": "/user_prompts/2/content",
      "prompt_quote": "我现在该怎么办",
-     "response": "/conversations/0",
+     "response": "/conversations/0/content",
      "claim": "多条线并行时，先做「一票否决」的那条：准入不过，性能分等于零，优化再好也是 0。",
      "method": "把赛制读成加权表：MySQL 正式用例是准入门，性能分只在准入通过后才计。于是把「跑通判题通道」排在「补内核」和「性能」之前。",
-     "evidence": [
-      {
-       "pointer": "/experiments/3/conclusion",
-       "quote": "公开用例 20/20 通过（判定用的是官方原码，不是自写评分）。公开用例通过不等于正式 29 用例准入通过，正式准入仍需在 Linux 容器里跑。"
-      },
-      {
-       "pointer": "/experiments/16/conclusion",
-       "quote": "随机对拍是这次最有价值的手段：优化快路径时它两次抓出真实缺陷（缓冲区形状不匹配导致快路径直接报错、以及并列行的选择顺序问题），靠人工读代码很难发现。"
-      }
-     ],
      "verification": "公开用例 20/20 → 准入探针 66 条 → 隐藏场景 6 类，全部在动性能之前完成；之后每次改性能都重跑这套回归，没有一次因性能改动破坏准入。",
      "transfer": "任何多目标评分里，先把「乘 0 的项」找出来单独处理，再谈边际收益。",
-     "limit": "这条优先级只在「准入一票否决」的赛制里成立；若评分是纯加性，先做便宜的高分项才对。"
+     "limit": "这条优先级只在「准入一票否决」的赛制里成立；若评分是纯加性，先做便宜的高分项才对。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/2/content",
+       "quote": "我现在该怎么办"
+      }
+     ],
+     "result_evidence": [
+      {
+       "pointer": "/experiments/11/conclusion",
+       "quote": "对题面点名的“不支持/不要求”项，正确的做法是返回约定错误，或者保证语义正确地执行；不能一边不报错一边换一种含义。"
+      }
+     ]
     },
     {
      "id": "i3",
      "prompt": "/user_prompts/3/content",
      "prompt_quote": "11道赛题做了吗",
-     "response": "/conversations/0",
+     "response": "/conversations/0/content",
      "claim": "把 11 道题收敛到 1 道，并且把「范围」写成一条可执行的验收命令，而不是一句口头承诺。",
      "method": "先确认题目边界（赛题包、判题器、验收入口），明确只做 600081；然后把这道题的全部自测收进一条命令，范围的边界就是这条命令的边界。",
-     "evidence": [
+     "verification": "范围收敛后，准入、语义、差分、隐藏场景全部收进一条命令（conformance 263 项 / 0 失败），提交前一次跑完；范围一旦扩散，这条命令就不存在。",
+     "transfer": "范围决策要落到「一个可执行的验收命令」上，否则「只做一道」只是口头承诺。",
+     "limit": "单题下注的代价是不可分散：这道题的任何一条准入缺口都会让整次参赛归零。",
+     "student_evidence": [
       {
-       "pointer": "/experiments/16/conclusion",
-       "quote": "随机对拍是这次最有价值的手段：优化快路径时它两次抓出真实缺陷（缓冲区形状不匹配导致快路径直接报错、以及并列行的选择顺序问题），靠人工读代码很难发现。"
-      },
+       "pointer": "/user_prompts/3/content",
+       "quote": "你可以在我的本地把这11道赛题做了吗"
+      }
+     ],
+     "result_evidence": [
       {
        "pointer": "/experiments/27/conclusion",
        "quote": "评测材料里的每条实验都指向一个能重新跑出同样数字的命令，这比实验本身的结论更重要：结论会过期，命令不会。"
       }
-     ],
-     "verification": "范围收敛后，准入、语义、差分、隐藏场景全部收进一条命令（conformance 263 项 / 0 失败），提交前一次跑完；范围一旦扩散，这条命令就不存在。",
-     "transfer": "范围决策要落到「一个可执行的验收命令」上，否则「只做一道」只是口头承诺。",
-     "limit": "单题下注的代价是不可分散：这道题的任何一条准入缺口都会让整次参赛归零。"
+     ]
     },
     {
      "id": "i17",
      "prompt": "/user_prompts/16/content",
      "prompt_quote": "接着继续完成昨天的内容，达到性能4300以及原始分数5分以上",
-     "response": "/conversations/19",
+     "response": "/conversations/19/content",
      "claim": "「查询占 2/3 权重」不等于「查询还有 2/3 的余量」：权重说明分数怎么合成，余量说明投进去还能不能动，下一步该优化谁要把两者乘起来。",
      "method": "先把题面的三项权重（60% 耗时 / 20% I/O / 20% 内存；写入 1/3、查询 2/3）与 bench 的两个实测时间并列，发现写入占了 82% 的耗时；再分别拆两条路径，量出各自还剩多少可动的量。",
-     "evidence": [
-      {
-       "pointer": "/experiments/52/result",
-       "quote": "写入 0.583 s（100 批 × 5.83 ms）、查询 0.125 s（1000 × 0.125 ms），写入占全部耗时的 82%。"
-      },
-      {
-       "pointer": "/experiments/54/result",
-       "quote": "三档 timeout 的 bench 全是 0.125 ms，一点没动；线程数 1 时 0.258 ms（gemv 40 → 77 us，写回没变快）。"
-      }
-     ],
      "verification": "写入 5.83 ms/批只剩约 20% 余量（fdatasync 0.8 ms 是持久化要求，向量字面量解析 1.0 ms 已是 numpy 下限），查询 0.125 ms 只剩不到 10%（gemv 40 us 是 5.12 MB 的带宽下限）；两条路都到边际，于是这一轮的力量放在「把已有余量拿干净」，而不是「再找一个数量级」。",
      "transfer": "遇到「权重告诉你优化谁」这类结论，先问一句：这个权重乘的是分数还是耗时？乘错了，就会去优化一个已经很小、已经没有余量的量。",
-     "limit": "余量是在这台机器上量的：判题机的 I/O 与内存配额不同，写入那 20% 在别处可能更大；若判题机的磁盘更快，fdatasync 的占比下降，结论的重心也要跟着移。"
+     "limit": "余量是在这台机器上量的：判题机的 I/O 与内存配额不同，写入那 20% 在别处可能更大；若判题机的磁盘更快，fdatasync 的占比下降，结论的重心也要跟着移。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/16/content",
+       "quote": "接着继续完成昨天的内容，达到性能4300以及原始分数5分以上，加分50分"
+      }
+     ],
+     "result_evidence": [
+      {
+       "pointer": "/experiments/52/result",
+       "quote": "写入 0.583 s（100 批 × 5.83 ms）、查询 0.125 s（1000 × 0.125 ms），写入占全部耗时的 82%。5.83 ms 里引擎 3.8 ms（fdatasync 0.8、100 个向量字面量解析约 1.0、语句解析 0.21，其余为列式写入与事务记账），协议约 2 ms。"
+      }
+     ]
     }
    ]
   },
@@ -110,64 +118,70 @@
      "id": "i4",
      "prompt": "/user_prompts/4/content",
      "prompt_quote": "优化这个加赛的代码，能够通过比赛",
-     "response": "/conversations/9",
+     "response": "/conversations/9/content",
      "claim": "「查询占 2/3 权重」不等于「优化查询」：评分对耗时的形状是 f(R)=R/(1+R)，是凹函数，该看斜率而不是权重。",
      "method": "把权重表代入 f(R) 求导：查询 R≈525 时 f=0.9981，再快一倍只值 +0.0006；写入 f≈0.50，减半值 +0.029，是查询的 50 倍。",
-     "evidence": [
+     "verification": "按这个判断先做写入侧（每行 22 次写系统调用 → 批量直通），再回到查询；两边的收益都记账，没有只挑好听的写。",
+     "transfer": "凹函数加权下，「权重大」和「收益大」是两件事；拿到权重表先求导，再排优先级。",
+     "limit": "斜率随当前 R 变化：R 掉到 1 附近时查询的边际会重新变大，方向要重算，不能当常数用。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/4/content",
+       "quote": "现在是让你去完成优化这个加赛的代码，能够通过比赛"
+      }
+     ],
+     "result_evidence": [
       {
        "pointer": "/experiments/29/result",
        "quote": "查询 f=0.9981，再快一倍只值 +0.0006；写入 f≈0.50，减半值 +0.029，是查询的 50 倍。"
-      },
-      {
-       "pointer": "/experiments/22/conclusion",
-       "quote": "把写 syscall 从「每个列值一次」降到「每个文件每次提交一次」，是这一轮投入产出比最高的一处改动。同时必须记住数据文件要在提交时 flush，否则 numpy 视图读到的是旧文件 —— 我第一次改完就踩了这个坑，查询从 1.2 ms 退化到 105 ms。"
       }
-     ],
-     "verification": "按这个判断先做写入侧（每行 22 次写系统调用 → 批量直通），再回到查询；两边的收益都记账，没有只挑好听的写。",
-     "transfer": "凹函数加权下，「权重大」和「收益大」是两件事；拿到权重表先求导，再排优先级。",
-     "limit": "斜率随当前 R 变化：R 掉到 1 附近时查询的边际会重新变大，方向要重算，不能当常数用。"
+     ]
     },
     {
      "id": "i5",
      "prompt": "/user_prompts/6/content",
      "prompt_quote": "最大算力给我跑起来",
-     "response": "/conversations/11",
+     "response": "/conversations/11/content",
      "claim": "线性代数的并发度应该取「配额」而不是「亲和性」：容器 --cpus=2 是 CFS 带宽配额，进程仍看得到全部核，按掩码开池会开出一堆跑不动的 worker。",
      "method": "同一段 sgemv（10000×128）分别用 1 / 2 / 按掩码 20 个线程跑，比较 p50 与均值。",
-     "evidence": [
+     "verification": "1 线程 69 us、2 线程 38 us；20 线程 p50 14 us 但均值 413 us（14 us 与 3 ms 交替的双峰）——而分数用的是均值。于是实现成 min(2, 可见核数)。",
+     "transfer": "任何「按可见核数开线程池」的库（OpenBLAS/MKL/OMP），在 CFS 配额下都要显式限流。",
+     "limit": "只在 aarch64 上验证；x86 的 SMT/CCX 拓扑不同，2 未必是那里的最优，所以写成 min(2, 核数) 而不是把 2 写死。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/6/content",
+       "quote": "最大算力给我跑起来"
+      }
+     ],
+     "result_evidence": [
       {
        "pointer": "/experiments/43/result",
        "quote": "1 线程 69 us；2 线程 38 us；按掩码（20）p50 14 us、均值 413 us（14 us 与 3 ms 交替双峰）。分数据用的是均值，所以「p50 最快」的那档在计分口径下是最慢的。引擎侧单查询均值 107.9 → 84.3 us。"
-      },
-      {
-       "pointer": "/experiments/45/conclusion",
-       "quote": "取舍的判据不是「看起来对不对」，而是「哪个仪器能分辨这个效应」；小效应要在噪声更低的层上验证，但结论要回到目标口径上表述。"
       }
-     ],
-     "verification": "1 线程 69 us、2 线程 38 us；20 线程 p50 14 us 但均值 413 us（14 us 与 3 ms 交替的双峰）——而分数用的是均值。于是实现成 min(2, 可见核数)。",
-     "transfer": "任何「按可见核数开线程池」的库（OpenBLAS/MKL/OMP），在 CFS 配额下都要显式限流。",
-     "limit": "只在 aarch64 上验证；x86 的 SMT/CCX 拓扑不同，2 未必是那里的最优，所以写成 min(2, 核数) 而不是把 2 写死。"
+     ]
     },
     {
      "id": "i6",
      "prompt": "/user_prompts/15/content",
      "prompt_quote": "不管你是用C语言，还是python语言，也好，只要能够达到性能达到4000，以上以及原始分5分以上,那你就是成功的",
-     "response": "/conversations/18",
+     "response": "/conversations/18/content",
      "claim": "换实现语言不是瓶颈的解：C 能拿回的只有 15 us，而判题镜像 --no-index + 预置 wheel 已经证明它没有编译器也没有网络。",
      "method": "先算上限（可动部分只剩 18 us，其中 12 us 是 128 个十进制字符串转 float32，C 可到 1.5 us），再核对「能不能编译」。",
-     "evidence": [
+     "verification": "上限 0.124→0.109 ms（约 +600 分）；无网络则无 gcc；本机 aarch64 到判题机 x86_64 的交叉工具链同样要联网；在 Dockerfile 里加「装编译器、失败跳过」，无网时是超时而不是失败。",
+     "transfer": "判断「要不要上更重的实现」时，先把上限算出来，再看拿不到时输多少——上限小于风险敞口就不做。",
+     "limit": "如果判题机其实有编译器或有网络，这 15 us 就是白丢的；该判断依赖一个本地无法验证的前提，所以写成「本轮的取舍」而不是「C 没用」。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/15/content",
+       "quote": "不管你是用C语言，还是python语言，也好，只要能够达到性能达到4000，以上以及原始分5分以上,那你就是成功的"
+      }
+     ],
+     "result_evidence": [
       {
        "pointer": "/experiments/50/result",
        "quote": "上限 0.124→0.109 ms（约 +600 分）；无网络 → 无 gcc；若在 Dockerfile 里加「装编译器，失败跳过」，无网络时是超时而不是失败，风险落在提交侧。"
-      },
-      {
-       "pointer": "/experiments/49/result",
-       "quote": "dumps 5.6 us、write 34.5 us、flush 0.1 us；换 os.write 仍 34.7 us；独立管道只要 0.3-1.2 us。方向不对称：客户端写请求 1.7 us，服务端写响应 34 us。"
       }
-     ],
-     "verification": "上限 0.124→0.109 ms（约 +600 分）；无网络则无 gcc；本机 aarch64 到判题机 x86_64 的交叉工具链同样要联网；在 Dockerfile 里加「装编译器、失败跳过」，无网时是超时而不是失败。",
-     "transfer": "判断「要不要上更重的实现」时，先把上限算出来，再看拿不到时输多少——上限小于风险敞口就不做。",
-     "limit": "如果判题机其实有编译器或有网络，这 15 us 就是白丢的；该判断依赖一个本地无法验证的前提，所以写成「本轮的取舍」而不是「C 没用」。"
+     ]
     }
    ]
   },
@@ -180,89 +194,93 @@
      "id": "i7",
      "prompt": "/user_prompts/5/content",
      "prompt_quote": "先停一下。不要直接做全量优化。请你先告诉我，当前代码的 baseline（基线）跑分是多少？Docker 镜像能正常构建吗？",
-     "response": "/conversations/11",
+     "response": "/conversations/11/content",
      "claim": "不接受「已经优化过了」的自述：先给基线，再谈优化。基线一量，上一轮「查询 8.8 ms」的说法就被推翻了。",
      "method": "要求先给出可复现的 baseline（写入/查询各自的同口径数字），再允许改一行代码；此后每处改动都要前后对比。",
-     "evidence": [
+     "verification": "基线 664 ms/次、写入 3.67 s；顺着这条线查出「向量化快路径从未被触发」——解析器把向量字面量标成了字符串，numpy 分支一次都没走到。",
+     "transfer": "任何「已完成优化」的结论都要用同口径基线复核；没有基线的优化是猜测。",
+     "limit": "基线口径本身也可能是错的：当时 664 ms 混入了冷缓存与协议开销，后来被拆成 239 us 地板 + 引擎开销，说明「基线」也要被质疑一次。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/5/content",
+       "quote": "先停一下。不要直接做全量优化。请你先告诉我，当前代码的 baseline（基线）跑分是多少？Docker 镜像能正常构建吗？"
+      }
+     ],
+     "result_evidence": [
       {
        "pointer": "/experiments/17/conclusion",
        "quote": "「上一轮 8.8 ms」的结论是错的，而且错得离谱：连 WHERE id = 4242 都要 716 ms，说明向量化路径根本没在工作。此前所有关于「快路径已经生效」的判断都建立在没验证过「这条语句到底走了哪条路径」之上 —— 这是本轮最重要的一次自我纠错。"
-      },
-      {
-       "pointer": "/experiments/18/conclusion",
-       "quote": "题包用的是带引号的向量字面量，而语法给它的标签是字符串。差一个节点标签，整条向量化路径就是死代码，而且从外部完全看不出来：结果仍然「对」，只是慢了 180 倍。"
       }
-     ],
-     "verification": "基线 664 ms/次、写入 3.67 s；顺着这条线查出「向量化快路径从未被触发」——解析器把向量字面量标成了字符串，numpy 分支一次都没走到。",
-     "transfer": "任何「已完成优化」的结论都要用同口径基线复核；没有基线的优化是猜测。",
-     "limit": "基线口径本身也可能是错的：当时 664 ms 混入了冷缓存与协议开销，后来被拆成 239 us 地板 + 引擎开销，说明「基线」也要被质疑一次。"
+     ]
     },
     {
      "id": "i8",
      "prompt": "/user_prompts/13/content",
      "prompt_quote": "2430还是太低了，无论你用什么办法把这这台电脑所有能用的都给我用起来，然后去跑这个数据，跑这个性能，然后原始分，你也必须给我跑到五以上，然后才能拿到该有的分数",
-     "response": "/conversations/17",
+     "response": "/conversations/17/content",
      "claim": "不接受推算出来的天花板：把「不可动的客户端段」换成最小替身单独测，实测比推算小 7 倍。",
      "method": "写一个只把请求原样回显的桩服务，用同一份 bench 客户代码跑 1500 次往返，测客户侧地板；再与真服务的分段计时对齐。",
-     "evidence": [
+     "verification": "桩服务 p50 16.5 us、均值 23.5 us，而记录里写的是 162 us；真服务上客户端六段合计 60.3 us、唤醒 18.5 us。天花板从 E≈2430 重算为 q≈117 us、E≈3780。",
+     "transfer": "把「我控制不了的那一段」换成一个只做这件事的替身来量，是判断「值不值得改」的唯一依据。",
+     "limit": "桩只能证伪它替换掉的那一段；判题机 harness 自身的开销本地看不见，所以修正后的数字仍是「本机上界」。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/13/content",
+       "quote": "2430还是太低了，无论你用什么办法把这这台电脑所有能用的都给我用起来，然后去跑这个数据，跑这个性能，然后原始分，你也必须给我跑到五以上，然后才能拿到该有的分数"
+      }
+     ],
+     "result_evidence": [
       {
        "pointer": "/experiments/42/result",
        "quote": "桩服务 p50 16.5 us、均值 23.5 us，比记录的 162 us 小 7 倍；真服务上客户端六段合计 60.3 us、唤醒 18.5 us、引擎 203.7 us。按新地板重算，「引擎零成本」的极限是 q=117 us、E≈3780。"
-      },
-      {
-       "pointer": "/experiments/31/conclusion",
-       "quote": "地板是决策依据而不是借口：它把「做一个更快的索引」这个方向直接否掉，并把后续工作限定在「压缩固定开销 + 压低扫描字节数」两条线上。"
       }
-     ],
-     "verification": "桩服务 p50 16.5 us、均值 23.5 us，而记录里写的是 162 us；真服务上客户端六段合计 60.3 us、唤醒 18.5 us。天花板从 E≈2430 重算为 q≈117 us、E≈3780。",
-     "transfer": "把「我控制不了的那一段」换成一个只做这件事的替身来量，是判断「值不值得改」的唯一依据。",
-     "limit": "桩只能证伪它替换掉的那一段；判题机 harness 自身的开销本地看不见，所以修正后的数字仍是「本机上界」。"
+     ]
     },
     {
      "id": "i9",
      "prompt": "/user_prompts/14/content",
      "prompt_quote": "不要在乎时间 ，把所有的算力以及功能全部运用上，能借鉴的立马去借鉴，能抄的去抄，必须要给我达到4300的标准以及5分的原始分",
-     "response": "/conversations/18",
+     "response": "/conversations/18/content",
      "claim": "同一份代码两次跑出 0.281 与 0.150 ms，不是噪声：机器是 10 大核 + 10 小核，进程没有亲和性。",
      "method": "先当仪器坏了处理：读 cpu_capacity 与 max_freq，再换三种跑法各跑 3-7 次，比 p50/p90。",
-     "evidence": [
+     "verification": "调度自由 0.281 ms、p90 是 p50 的 2.1 倍；钉两个大核 0.150 ms、p90/p50 降到 1.08。上一轮「34% 的均值/p50 差来自 GC」的解释因此作废。",
+     "transfer": "跑不出上次的数时，先复现环境（亲和性、频率、配额、邻居），再怀疑自己的改动。",
+     "limit": "只在 aarch64 大小核上验证；同构机器看不到这个效应，所以代码里做成「同构时空操作」，而不是把「钉两个核」写成结论。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/14/content",
+       "quote": "不要在乎时间 ，把所有的算力以及功能全部运用上，能借鉴的立马去借鉴，能抄的去抄，必须要给我达到4300的标准以及5分的原始分"
+      }
+     ],
+     "result_evidence": [
       {
        "pointer": "/experiments/47/result",
        "quote": "机器是 10 个 Cortex-X925（3.9 GHz，capacity 997-1024）+ 10 个 Cortex-A725（2.8 GHz，capacity 718-731），capability 差 40%。调度自由 0.281 ms、p90 是 p50 的 2.1 倍；钉两个大核 0.150 ms、p90 是 p50 的 1.08 倍。1.87 倍，且尾巴消失。"
-      },
-      {
-       "pointer": "/experiments/32/conclusion",
-       "quote": "profiler 只用来看「占比排序」，绝对时间一律用无 profiler 的多轮中位数。这条直接推翻了我此前「写入比基线慢 17%」的判断。"
       }
-     ],
-     "verification": "调度自由 0.281 ms、p90 是 p50 的 2.1 倍；钉两个大核 0.150 ms、p90/p50 降到 1.08。上一轮「34% 的均值/p50 差来自 GC」的解释因此作废。",
-     "transfer": "跑不出上次的数时，先复现环境（亲和性、频率、配额、邻居），再怀疑自己的改动。",
-     "limit": "只在 aarch64 大小核上验证；同构机器看不到这个效应，所以代码里做成「同构时空操作」，而不是把「钉两个核」写成结论。"
+     ]
     },
     {
      "id": "i10",
      "prompt": "/user_prompts/10/content",
      "prompt_quote": "可以不按照我们这个基线，然后重新做，但必须性能和原始分要上去。",
-     "response": "/conversations/12",
+     "response": "/conversations/12/content",
      "claim": "参赛者否决「在基线上小修」，授权重做——重写的依据不是「想重写」，而是把快路径的三处结构性浪费（三趟扫描、float64 存储精度、先选区后投影）一次算清。",
      "method": "先算「小修」的累计收益与重写的收益，再决定：一趟扫描 + float32 存储精度 + 只投影最终 10 行。",
-     "evidence": [
+     "verification": "扫描 128→58 us；投影调用 42→10 行、固定开销 69→50 us；同口径 A/B（git worktree）不带过滤 303.1→129.7 us、带过滤 1425.4→127.1 us。",
+     "transfer": "「小修」和「重写」是可以算的：把两者的上限都估出来，再选代价小的那条，而不是凭手感。",
+     "limit": "重写期间语义风险最高，必须靠差分对拍锁死（120 条零差异）；没有这条测试，重写就是赌博。",
+     "student_evidence": [
       {
-       "pointer": "/experiments/38/result",
-       "quote": "_scan_topk 128 µs，其中 f64 matvec 只有 22 µs；改成一趟 + float32 存储精度 + 一次选区后降到 58 µs。"
-      },
-      {
-       "pointer": "/experiments/39/result",
-       "quote": "改成先用精算距离排序、再只对最终 10 行读列与投影；_project 调用 42→10，固定开销 69 µs→50 µs。"
-      },
+       "pointer": "/user_prompts/10/content",
+       "quote": "你可以不按照我们这个基线，然后重新做，但必须性能和原始分要上去。"
+      }
+     ],
+     "result_evidence": [
       {
        "pointer": "/experiments/40/result",
        "quote": "不带过滤 303.1→129.7 µs（2.3 倍）；带过滤 1425.4→127.1 µs（11.2 倍）；按各占一半算平均 864→128 µs（6.75 倍）。"
       }
-     ],
-     "verification": "扫描 128→58 us；投影调用 42→10 行、固定开销 69→50 us；同口径 A/B（git worktree）不带过滤 303.1→129.7 us、带过滤 1425.4→127.1 us。",
-     "transfer": "「小修」和「重写」是可以算的：把两者的上限都估出来，再选代价小的那条，而不是凭手感。",
-     "limit": "重写期间语义风险最高，必须靠差分对拍锁死（120 条零差异）；没有这条测试，重写就是赌博。"
+     ]
     }
    ]
   },
@@ -275,64 +293,74 @@
      "id": "i11",
      "prompt": "/user_prompts/1/content",
      "prompt_quote": "Docker 的判题环境。但我的现状是：未安装 Docker Desktop、WSL2 没有安装任何发行版、访问 registry-1.docker.io 超时。 根据我的 Pow",
-     "response": "/conversations/1",
+     "response": "/conversations/1/content",
      "claim": "本地环境不是背景条件，而是第一个真问题：WSL2 未装发行版、registry 超时、PowerShell 脚本三处 bug，逐条排。",
      "method": "把「环境不可用」拆成故障树：先修 WSL 安装，再修脚本（$Args 撞自动变量、Detail 拼接、WSL 误判），最后验 registry 可达性。",
-     "evidence": [
+     "verification": "每修一处就跑一次同一脚本，直到能起判题进程；失败的尝试没有删，全部留在记录里。",
+     "transfer": "环境问题要当故障树分解，而不是当前置条件；每一步都要有一个可观察的通过/失败信号。",
+     "limit": "本机验证替代不了判题容器：Linux x86_64、只读根文件系统、--network=none 这套组合本地跑不出来，只能靠「不写根文件系统 / 依赖构建期装好 / numpy 缺失自动降级」规避。",
+     "student_evidence": [
       {
        "pointer": "/conversations/1/content",
        "quote": "PowerShell 5.1 需要 UTF-8 BOM 才能正确解析中文脚本，我补上再跑。」 「脚本有三处 bug（$Args 撞自动变量、Detail 拼接、WSL 未安装误判）。"
       },
       {
-       "pointer": "/experiments/44/conclusion",
-       "quote": "报错说「盘满」而 df 说有空，是器材在说谎；判据应当是「它写到哪个目录」，不是错误码。"
+       "pointer": "/user_prompts/1/content",
+       "quote": "我在 Windows 环境下开发，需要运行一个基于 Docker 的判题环境。但我的现状是：未安装 Docker Desktop、WSL2 没有安装任何发行版、访问 registry-1.docker.io 超时。 根据我的 PowerShell 配置（图2显示执行过 wsl --install -d Ubuntu 但需重启），请给我一份保姆级的、包含所有排错步骤的教程： 如何彻底清理旧 WSL 并安装正确的 WSL2 Ubuntu。 如何在 WSL2 中配置有效的国内 Do"
       }
      ],
-     "verification": "每修一处就跑一次同一脚本，直到能起判题进程；失败的尝试没有删，全部留在记录里。",
-     "transfer": "环境问题要当故障树分解，而不是当前置条件；每一步都要有一个可观察的通过/失败信号。",
-     "limit": "本机验证替代不了判题容器：Linux x86_64、只读根文件系统、--network=none 这套组合本地跑不出来，只能靠「不写根文件系统 / 依赖构建期装好 / numpy 缺失自动降级」规避。"
+     "result_evidence": [
+      {
+       "pointer": "/experiments/7/conclusion",
+       "quote": "这是本地开发环境的平台差异，不是判题端（Linux）的问题，但它一度把 3 个 INSERT 相关用例全部带崩。修法是 os.open 加 O_BINARY、write_at 同步更新 _size。"
+      }
+     ]
     },
     {
      "id": "i12",
      "prompt": "/user_prompts/7/content",
      "prompt_quote": "令牌（已脱敏）：大赛账户，OceanBase 社区的；我已经在这个环境里装了插件，你可以直接去调用，然后去提测。附件是 minivectordb-bonus.zip。",
-     "response": "/conversations/16",
+     "response": "/conversations/16/content",
      "claim": "「令牌被截断」是一个判断而不是事实：先数长度、再验身份、最后真推一次，三步分开验。",
      "method": "长度 93 字符；调 /user 验 login；查仓库 permissions 是否含 push；最后真推一个空提交。",
-     "evidence": [
+     "verification": "/user 返回 login=wzhaihqy、permissions.push=true、push 成功——原判断被推翻，省掉一次「重新生成令牌」的往返。",
+     "transfer": "把「疑似凭证问题」拆成可独立验证的三步，比重新申请凭证快得多。",
+     "limit": "网页登录仍走不通（2FA 收不到验证码），所以只用环境里已配置的凭据，不碰账号密码。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/7/content",
+       "quote": "直接给你我的 git 仓库的登录令牌（已脱敏）：大赛账户，OceanBase 社区的；我已经在这个环境里装了插件，你可以直接去调用，然后去提测。附件是 minivectordb-bonus.zip。"
+      }
+     ],
+     "result_evidence": [
       {
        "pointer": "/experiments/41/result",
        "quote": "长度 93 字符；/user 返回 login=wzhaihqy；仓库 permissions 含 push=true；push 成功 3c07c8f7..ed466ccf。"
-      },
-      {
-       "pointer": "/experiments/9/conclusion",
-       "quote": "假设错了：OverflowError 那条分支是死代码，CPython 3.12 的 array('f') 溢出时静默变 inf。这类错误只有在真的按题面条款造反例时才会暴露，靠跑公开用例发现不了。"
       }
-     ],
-     "verification": "/user 返回 login=wzhaihqy、permissions.push=true、push 成功——原判断被推翻，省掉一次「重新生成令牌」的往返。",
-     "transfer": "把「疑似凭证问题」拆成可独立验证的三步，比重新申请凭证快得多。",
-     "limit": "网页登录仍走不通（2FA 收不到验证码），所以只用环境里已配置的凭据，不碰账号密码。"
+     ]
     },
     {
      "id": "i13",
      "prompt": "/user_prompts/9/content",
      "prompt_quote": "4300，然后 Agent prompt 原始分大于五。",
-     "response": "/conversations/9",
+     "response": "/conversations/9/content",
      "claim": "用一个平台分数反解评分函数，把「提分」化简成「最小化单查询耗时」这个可优化的量。",
      "method": "拿已观测的 E=296.787 与题面基线 664 ms 反解 R_查≈443，再用第二轮观测校验（E≈442.9/q 与平台数一致）。",
-     "evidence": [
+     "verification": "R≈443 与本地同版本 bench 1.482 ms 反解 1.499 ms 吻合到 1.1%；据此把写入项（3.67/w 只值 1.4/3 分）整体移出范围。",
+     "transfer": "一次观测 + 一个模型 = 一个可判断的目标；比试错撞分快一个量级。",
+     "limit": "反解依赖两个常数与「q 的口径」这一假设；如果平台的 q 不含客户端开销，可达性判断会翻转，而这一点本地无法验证。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/9/content",
+       "quote": "你要帮我完成，然后推送到仓库里面，然后最后我让你提测，然后你再帮我提测完成。这边的加赛的性能评测要求他是要大于 4300，然后 Agent prompt 原始分大于五。"
+      }
+     ],
+     "result_evidence": [
       {
        "pointer": "/experiments/30/result",
        "quote": "R_查≈443；用题面基线 664 ms 反推单次查询 664/443≈1.5 ms，与本地端到端实测 1.26~1.5 ms 吻合到三位有效数字。"
-      },
-      {
-       "pointer": "/experiments/46/result",
-       "quote": "E≈442.9/q 与平台数一致（264 us ↔ 1679.6）；引擎零成本时 q=117 us、E≈3780，而榜首 4004.7 对应 q=111 us——榜首比「引擎完全不花时间」还快 5%。"
       }
-     ],
-     "verification": "R≈443 与本地同版本 bench 1.482 ms 反解 1.499 ms 吻合到 1.1%；据此把写入项（3.67/w 只值 1.4/3 分）整体移出范围。",
-     "transfer": "一次观测 + 一个模型 = 一个可判断的目标；比试错撞分快一个量级。",
-     "limit": "反解依赖两个常数与「q 的口径」这一假设；如果平台的 q 不含客户端开销，可达性判断会翻转，而这一点本地无法验证。"
+     ]
     }
    ]
   },
@@ -345,60 +373,74 @@
      "id": "i14",
      "prompt": "/user_prompts/8/content",
      "prompt_quote": "只有我让你去提测的时候你才去提。",
-     "response": "/conversations/16",
+     "response": "/conversations/16/content",
      "claim": "把「提交权」留在参赛者手里：助手只负责推仓库，提测必须等明确指令。",
      "method": "在对话里把「推代码」与「提交评测」拆成两个动作，前者可自主，后者需要授权；提交前把 commit SHA 与验证结果一并交出。",
-     "evidence": [
+     "verification": "整轮开发中没有一次未经允许的提测；每次提测前都先给 SHA、验证结论与剩余风险。",
+     "transfer": "外部副作用（提交、发布、发信）默认需要人确认，内部动作（读、改、测）可以自主。",
+     "limit": "这条靠纪律不靠代码：没有机制强制，只能靠每次都把动作边界说清楚。",
+     "student_evidence": [
       {
        "pointer": "/conversations/16/content",
        "quote": "GitHub 网页登录我这边做不了（账号密码登录必然触发 2FA 验证码，我收不到），而且用你的邮箱密码登你的账号这件事我不该做。但两条正路都是通的：克隆里已配好的凭据可以直接 push，不需要你再给东西；或者把仓库设为 public。我没有把它们写进任何文件，也没存进 git 配置。"
+      },
+      {
+       "pointer": "/user_prompts/8/content",
+       "quote": "只有我让你去提测的时候你才去提。"
       }
      ],
-     "verification": "整轮开发中没有一次未经允许的提测；每次提测前都先给 SHA、验证结论与剩余风险。",
-     "transfer": "外部副作用（提交、发布、发信）默认需要人确认，内部动作（读、改、测）可以自主。",
-     "limit": "这条靠纪律不靠代码：没有机制强制，只能靠每次都把动作边界说清楚。"
+     "result_evidence": [
+      {
+       "pointer": "/experiments/44/result",
+       "quote": "删掉那一行即恢复：10000 行插入 0.788 s、1000 次查询 0.291 s；此后每次基准都显式传 --data-dir 并核对报告里的 data_dir_bytes = 11640412。"
+      }
+     ]
     },
     {
      "id": "i15",
      "prompt": "/user_prompts/11/content",
      "prompt_quote": "今天只有一次提测的机会了，你需要经过我的允许，他才能提测。平台四项输出：MySQL 正式用例=通过（准入，不计排名分）；性能原始分=296.787165；Agent Prompt ",
-     "response": "/conversations/8",
+     "response": "/conversations/8/content",
      "claim": "额度只剩一次时，「先修什么」本身就是决策：把提交前必须全绿的检查收进一条命令，让这一次提交可复核。",
      "method": "把散落的 5 个自测脚本收进 conformance，一条命令跑完准入、语义、差分、隐藏场景；提交前只认这一条的结论。",
-     "evidence": [
-      {
-       "pointer": "/experiments/27/conclusion",
-       "quote": "评测材料里的每条实验都指向一个能重新跑出同样数字的命令，这比实验本身的结论更重要：结论会过期，命令不会。"
-      },
-      {
-       "pointer": "/experiments/25/conclusion",
-       "quote": "这条 bug 是我自己打开快路径才引入的，人工读代码时它藏在 \"limit\" 变量旁边，一眼看不出来。差分测试的价值就在这里：它不依赖我记得检查什么。"
-      }
-     ],
      "verification": "conformance 263 项 / 0 失败成为每轮提交的门槛；此后每次提交前都贴这一条的输出，而不是贴零散脚本的结果。",
      "transfer": "不可逆动作之前，先把它变成一张可自动复核的清单——这是「只有一次机会」唯一能做的准备。",
-     "limit": "一条命令只覆盖已经想到的检查；第 29 个隐藏用例不在里面，所以「全绿」不等于「准入通过」。"
+     "limit": "一条命令只覆盖已经想到的检查；第 29 个隐藏用例不在里面，所以「全绿」不等于「准入通过」。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/11/content",
+       "quote": "不管你推送到哪个仓库里面，你只要最后可以提测就行，今天只有一次提测的机会了，你需要经过我的允许，他才能提测。平台四项输出：MySQL 正式用例=通过（准入，不计排名分）；性能原始分=296.787165；Agent Prompt 原始分=0.5。"
+      }
+     ],
+     "result_evidence": [
+      {
+       "pointer": "/experiments/51/result",
+       "quote": "0.264/0.281-0.343 = 0.77-0.94（判题机不比本机慢）；本机 0.124 ms 折平台 0.095-0.117 ms、E≈3800-4660。4300 的门槛是本机 bench ≤0.110-0.134 ms。上一轮的 1.87 跨了代码版本，作废。"
+      }
+     ]
     },
     {
      "id": "i16",
      "prompt": "/user_prompts/12/content",
      "prompt_quote": "目标不能变，只要谈到 4300 以上还能拿到，不管你用什么方法去做；然后原始分大于 5，5 以上。",
-     "response": "/conversations/18",
+     "response": "/conversations/18/content",
      "claim": "目标不能变，就把它翻译成一条可判断的门槛：4300 对应本机 bench ≤0.110-0.134 ms，而实测 0.124 ms 落在带内。",
      "method": "先定标「本机 → 判题机」的换算：同一份代码的两次观测（平台 q=0.264 与本机 0.281-0.343）相除得 0.77-0.94；再用它把平台目标折成本机门槛。",
-     "evidence": [
-      {
-       "pointer": "/experiments/51/result",
-       "quote": "0.264/0.281-0.343 = 0.77-0.94（判题机不比本机慢）；本机 0.124 ms 折平台 0.095-0.117 ms、E≈3800-4660。4300 的门槛是本机 bench ≤0.110-0.134 ms。上一轮的 1.87 跨了代码版本，作废。"
-      },
-      {
-       "pointer": "/experiments/48/result",
-       "quote": "候选从 20 行降到 11 行，精确重算 18.7→11 us，整条查询 0.141→0.126 ms（-10.6%）；263 项验收 0 失败、120 条差分逐位一致。落在带外的行比边界行差出 1e-3-2*6e-5，构造上不可能进答案。"
-      }
-     ],
      "verification": "本机 0.124 ms 折平台 0.095-0.117 ms、E≈3800-4660；门槛与实测同量级，所以结论是「落在门槛两侧」，不是「不可达」。上一版把两个不同版本的数相除得到 1.87，已作废。",
      "transfer": "跨机目标先定标再谈进度，且定标用的两个数必须来自同一份代码，否则系数会错一倍。",
-     "limit": "换算只用了一对相隔一天的观测，0.77 里混着两次判题机的负载差；它给的是区间，不是保证。"
+     "limit": "换算只用了一对相隔一天的观测，0.77 里混着两次判题机的负载差；它给的是区间，不是保证。",
+     "student_evidence": [
+      {
+       "pointer": "/user_prompts/12/content",
+       "quote": "我可以很明确地告诉你，这个就是我生成的完整令牌，先访问。还有目标不能变，只要谈到 4300 以上还能拿到，不管你用什么方法去做；然后原始分大于 5，5 以上。"
+      }
+     ],
+     "result_evidence": [
+      {
+       "pointer": "/experiments/46/result",
+       "quote": "E≈442.9/q 与平台数一致（264 us ↔ 1679.6）；引擎零成本时 q=117 us、E≈3780，而榜首 4004.7 对应 q=111 us——榜首比「引擎完全不花时间」还快 5%。"
+      }
+     ]
     }
    ]
   }

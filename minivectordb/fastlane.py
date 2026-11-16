@@ -22,6 +22,7 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
+import weakref
 from typing import Any
 
 try:  # pragma: no cover - depends on the image
@@ -45,6 +46,36 @@ _out_size = 0
 _slot_buffer: Any = None
 _slot_pointer: Any = None
 _slot_size = 0
+
+# Addresses of the arrays a query hands to the kernel, remembered between
+# calls.  ``array.ctypes.data`` builds a fresh ctypes object every time it is
+# read, and that costs about half a microsecond; a query makes seven of them,
+# which is more than the call they feed.  The address of a numpy array only
+# changes when the array itself is replaced -- the store builds a new view
+# whenever the mapping is remapped -- so the address is remembered together
+# with a weak reference to the array it belongs to.  An entry is used only
+# when that very array is still alive, so a freed array can never lend its
+# address to another one.
+_ADDRESSES: dict[int, tuple] = {}
+
+
+def _address(array: Any) -> Any:
+    """The address of ``array``'s buffer, as a ctypes void pointer."""
+
+    key = id(array)
+    entry = _ADDRESSES.get(key)
+    if entry is not None:
+        reference, pointer = entry
+        if reference() is array:
+            return pointer
+    pointer = ctypes.c_void_p(array.ctypes.data)
+    if len(_ADDRESSES) > 512:
+        _ADDRESSES.clear()
+    try:
+        _ADDRESSES[key] = (weakref.ref(array), pointer)
+    except TypeError:                     # pragma: no cover - not weakref-able
+        pass
+    return pointer
 
 
 def _disabled() -> bool:
@@ -263,13 +294,14 @@ def topk(coarse: Any, norms: Any, matrix: Any, query: Any, keys: Any,
     out_slots, out_pointer = _slot_slot(count)
     out_dists, out_dists_pointer = _out_slot(max(count, 1))
     written = lib.fl_topk(
-        coarse.ctypes.data, 0 if norms is None else norms.ctypes.data,
-        matrix.ctypes.data, query.ctypes.data,
-        0 if keys is None else keys.ctypes.data,
-        0 if rows_of is None else rows_of.ctypes.data,
-        0 if ids_of is None else ids_of.ctypes.data,
+        _address(coarse),
+        None if norms is None else _address(norms),
+        _address(matrix), _address(query),
+        None if keys is None else _address(keys),
+        None if rows_of is None else _address(rows_of),
+        None if ids_of is None else _address(ids_of),
         count, dim, int(take), 0, float(tolerance),
-        out_slots.ctypes.data, out_dists.ctypes.data)
+        _address(out_slots), _address(out_dists))
     if written < 0:
         return None
     return out_slots[:written].copy(), out_dists[:written].copy()

@@ -161,6 +161,7 @@ class Engine:
         # scanned column).  Allocated on the first query and then reused:
         # every query writes it, reads it once per pass and never keeps it.
         self._distance_buffer = None
+        self._distance_view = None
         self._view_cache = None
         self._scan_width = 0
 
@@ -1127,12 +1128,22 @@ class Engine:
         view = self._view(store, column_position)
         matrix = None if view is None else view[0]
         keys = store.primary_keys() if view is None else view[2]
-        query64 = query32.astype(numpy.float64)
         if matrix is not None and kernel_exact:
             # The kernel already computed the exact distances and ordered the
             # candidates by (distance, primary key); nothing is left to do.
+            #
+            # The answer is ten numbers wide, and numpy's fancy indexing on
+            # ten rows costs more than assembling them does: the slots and the
+            # distances are taken as Python lists once, and the head of the
+            # order is what the question asks for.
             exact = scanned[1]
-            order = numpy.arange(slots.size)
+            known = keys[slots].tolist()
+            reported = exact.tolist()
+            stop = min(offset + limit, len(known))
+            known_keys = known[offset:stop]
+            distances = reported[offset:stop]
+            chosen = list(range(offset, stop))
+            ordered = True
         elif matrix is not None:
             # The candidate vectors are taken in one numpy call; asking for one
             # row at a time costs more than the scan itself.  The distance of
@@ -1149,12 +1160,15 @@ class Engine:
             # numpy expression computes the same numbers itself.
             exact = fastlane.exact_distances(matrix[slots], query32)
             if exact is None:
+                query64 = query32.astype(numpy.float64)
                 vectors = matrix[slots].astype(numpy.float64)
                 numpy.subtract(vectors, query64, out=vectors)
                 numpy.multiply(vectors, vectors, out=vectors)
                 exact = numpy.sqrt(numpy.cumsum(vectors, axis=1)[:, -1])
             order = numpy.lexsort((keys[slots], exact))
+            ordered = False
         else:
+            query64 = query32.astype(numpy.float64)
             query_values = query64.tolist()
             exact = []
             for slot in slots.tolist():
@@ -1164,10 +1178,15 @@ class Engine:
             known = keys[slots].tolist()
             order = sorted(range(slots.size),
                            key=lambda index: (exact[index], known[index]))
-        chosen = order[offset:offset + limit]
+            ordered = False
+        if not ordered:
+            chosen = order[offset:offset + limit]
+            known_keys = None
+            distances = None
         if key_only:
-            known_keys = keys[slots[chosen]].tolist()
-            distances = [float(exact[index]) for index in chosen]
+            if known_keys is None:
+                known_keys = keys[slots[chosen]].tolist()
+                distances = [float(exact[index]) for index in chosen]
             if len(plan_items) == 1:
                 if plan_items[0][0] == _PROJECT_DISTANCE:
                     return {"columns": names, "rows": [[d] for d in distances]}
@@ -1511,7 +1530,16 @@ class Engine:
             buffer = numpy.empty(max(count, self._scan_width), dtype=numpy.float32)
             self._distance_buffer = buffer
             self._scan_width = buffer.shape[0]
-        product = buffer[:count]
+            self._distance_view = None
+        # The window of the buffer the query writes into is kept between
+        # queries: the kernel is handed the address of that window, and an
+        # address is worth remembering only while the array it belongs to
+        # stays the same one.  A fresh ``buffer[:count]`` per query would be
+        # a fresh address every time.
+        product = self._distance_view
+        if product is None or product.base is not buffer or product.shape[0] != count:
+            product = buffer[:count]
+            self._distance_view = product
         numpy.dot(rows, query32, out=product)
         if row_keys is not None:
             keys = row_keys

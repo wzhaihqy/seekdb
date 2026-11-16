@@ -433,6 +433,50 @@ bool candidate_less(const Candidate &left, const Candidate &right)
     return left.key < right.key;
 }
 
+/* The space one selection needs, kept between calls.
+ *
+ * The selection used to build two arrays of one element per candidate row
+ * on every call -- forty kilobytes each, allocated, filled and freed while
+ * the query waited.  The space is the same for every query of the same
+ * shape, so it is built once and grown when a wider scan needs more.
+ *
+ * It is a plain process wide buffer on purpose: the object is loaded by one
+ * process that answers one request at a time, and a thread local buffer of a
+ * type with a destructor would ask the C++ runtime for a newer libc than the
+ * one the judge runs. */
+struct Scratch {
+    float *squared;       /* the coarse distance of every candidate      */
+    uint32_t *kept;       /* the order key of every collected row        */
+    int64_t *kept_index;  /* the row every collected key came from       */
+    uint32_t *order;      /* a copy of the keys, for the selection       */
+    float *sample;        /* the sample the threshold is taken from      */
+    int64_t capacity;
+
+    Scratch() : squared(NULL), kept(NULL), kept_index(NULL), order(NULL),
+                sample(NULL), capacity(0) {}
+};
+
+Scratch &fl_scratch(int64_t count)
+{
+    static Scratch scratch;
+    if (scratch.capacity < count) {
+        int64_t capacity = count < 1 ? 1 : count;
+        free(scratch.squared);
+        free(scratch.kept);
+        free(scratch.kept_index);
+        free(scratch.order);
+        scratch.squared = static_cast<float *>(malloc(static_cast<size_t>(capacity) * sizeof(float)));
+        scratch.kept = static_cast<uint32_t *>(malloc(static_cast<size_t>(capacity) * sizeof(uint32_t)));
+        scratch.kept_index = static_cast<int64_t *>(malloc(static_cast<size_t>(capacity) * sizeof(int64_t)));
+        scratch.order = static_cast<uint32_t *>(malloc(static_cast<size_t>(capacity) * sizeof(uint32_t)));
+        scratch.capacity = capacity;
+    }
+    if (scratch.sample == NULL) {
+        scratch.sample = static_cast<float *>(malloc(1024 * sizeof(float)));
+    }
+    return scratch;
+}
+
 }  /* namespace */
 
 /*
@@ -467,32 +511,121 @@ extern "C" int64_t fl_topk(const float *coarse, const float *norms,
     if (take > id_count) take = id_count;
     if (take <= 0) return 0;
 
+    Scratch &scratch = fl_scratch(id_count);
+    float *squared = scratch.squared;
+    uint32_t *kept = scratch.kept;
+    int64_t *kept_index = scratch.kept_index;
+    uint32_t *order = scratch.order;
+    float *sample = scratch.sample;
+
     /* The coarse distance of a row, in the same float32 arithmetic the
      * numpy path used: (product * -2) + |row|^2.  The multiply and the add
      * stay separate (the compiler must not fuse them, hence
      * -ffp-contract=off), so the bits are the bits the numpy path saw and
-     * the band below is the band the numpy path would have taken. */
-    std::vector<float> squared(static_cast<size_t>(id_count));
-    for (int64_t i = 0; i < id_count; i++) {
-        float value = coarse[i] * -2.0f;
-        squared[static_cast<size_t>(i)] = norms ? value + norms[i] : value;
+     * the band below is the band the numpy path would have taken.  The two
+     * cases are written apart so that the compiler can use a vector unit:
+     * the test on ``norms`` inside the loop kept it from doing so. */
+    if (norms) {
+        for (int64_t i = 0; i < id_count; i++) {
+            squared[i] = coarse[i] * -2.0f + norms[i];
+        }
+    } else {
+        for (int64_t i = 0; i < id_count; i++) {
+            squared[i] = coarse[i] * -2.0f;
+        }
     }
 
-    /* The boundary is the take-th smallest coarse distance.  The radix
-     * selection returns that value without touching the array it ranks: the
-     * comparison based partition it replaces was the single largest cost of
-     * a query, because every one of its branches is data dependent and the
-     * column changes from one query to the next. */
-    float boundary = fl_select_kth(squared.data(), id_count, take - 1);
+    /* The boundary is the take-th smallest coarse distance.
+     *
+     * A sample of the column says where it is: every stride-th row is read,
+     * the wanted rank is scaled by the sampling rate and the threshold is
+     * taken from the sample.  The rows that the threshold admits are
+     * collected in the same pass that looks for them, and the rows that tie
+     * with the boundary are collected with them -- the threshold is already
+     * at or above the boundary, so widening it by the tolerance of the band
+     * admits every row the band can hold.  One pass over the column
+     * therefore finds the boundary and the band together; the two passes the
+     * boundary and the band used to need are one now.
+     *
+     * The estimate can be low -- the sample may miss the shape of the
+     * column -- so the number of collected rows is checked, and a threshold
+     * that kept too few is raised and the pass repeated. */
+    const int64_t sample_size = 1024;
+    int64_t stride = id_count / sample_size;
+    if (stride < 1) stride = 1;
+    int64_t sampled = 0;
+    for (int64_t i = 0; i * stride < id_count && sampled < sample_size; i++) {
+        sample[sampled++] = squared[i * stride];
+    }
+    int64_t rank = take - 1;
+    int64_t local_rank = (rank + 1) * sampled / id_count + 4;
+    if (local_rank >= sampled) local_rank = sampled - 1;
+    if (local_rank < 0) local_rank = 0;
+    std::nth_element(sample, sample + local_rank, sample + sampled);
+    float threshold = sample[local_rank];
+    float limit = static_cast<float>(static_cast<double>(threshold) + tolerance);
+
+    int64_t kept_count = 0;
+    for (int attempt = 0; attempt < 24; attempt++) {
+        kept_count = 0;
+        for (int64_t i = 0; i < id_count; i++) {
+            if (squared[i] <= limit) {
+                kept[kept_count] = fl_order_key(squared[i]);
+                kept_index[kept_count] = i;
+                kept_count++;
+            }
+        }
+        if (kept_count > rank) break;
+        /* Too few rows below the threshold: the sample understated the
+         * distribution.  A higher quantile of the same sample is a better
+         * threshold than the next float above, which would crawl towards the
+         * boundary one unit in the last place at a time. */
+        int64_t next = local_rank + local_rank / 4 + 8;
+        if (next >= sampled) {
+            /* The whole sample is below the boundary: the sample cannot
+             * say where it is. */
+            next = sampled - 1;
+            if (next == local_rank) break;
+        }
+        local_rank = next;
+        std::nth_element(sample, sample + local_rank, sample + sampled);
+        threshold = sample[local_rank];
+        limit = static_cast<float>(static_cast<double>(threshold) + tolerance);
+    }
+
+    float boundary;
+    if (kept_count > rank) {
+        /* The boundary is the take-th smallest of the collected rows.  They
+         * all sit at or below the threshold, and the threshold is at or
+         * above the boundary, so the collected set holds every row that can
+         * reach the answer. */
+        for (int64_t i = 0; i < kept_count; i++) order[i] = kept[i];
+        std::nth_element(order, order + rank, order + kept_count);
+        boundary = fl_order_value(order[rank]);
+    } else {
+        /* The threshold could not be raised far enough: the sample was too
+         * unrepresentative.  The radix route always answers. */
+        boundary = fl_select_kth(squared, id_count, rank);
+        kept_count = 0;
+        float band_limit = static_cast<float>(static_cast<double>(boundary) + tolerance);
+        for (int64_t i = 0; i < id_count; i++) {
+            if (squared[i] > band_limit) continue;
+            kept[kept_count] = fl_order_key(squared[i]);
+            kept_index[kept_count] = i;
+            kept_count++;
+        }
+    }
 
     /* Every row that ties with the boundary stays in the band: the exact
      * stage and the primary key settle the order between them. */
-    float limit = static_cast<float>(static_cast<double>(boundary) + tolerance);
+    float band_limit = static_cast<float>(static_cast<double>(boundary) + tolerance);
     std::vector<Candidate> band;
     band.reserve(static_cast<size_t>(take) * 2 + 8);
-    for (int64_t i = 0; i < id_count; i++) {
-        if (squared[static_cast<size_t>(i)] > limit) continue;
-        int64_t row = rows_of ? rows_of[i] : i;
+    for (int64_t i = 0; i < kept_count; i++) {
+        float value = fl_order_value(kept[i]);
+        if (value > band_limit) continue;
+        int64_t index = kept_index[i];
+        int64_t row = rows_of ? rows_of[index] : index;
         double distance = 0.0;
         if (matrix && query) {
             const float *values = matrix + static_cast<size_t>(row)
@@ -507,8 +640,8 @@ extern "C" int64_t fl_topk(const float *coarse, const float *norms,
         }
         Candidate candidate;
         candidate.distance = distance;
-        candidate.key = keys ? keys[i] : row;
-        candidate.row = ids_of ? ids_of[i] : row;
+        candidate.key = keys ? keys[index] : row;
+        candidate.row = ids_of ? ids_of[index] : row;
         band.push_back(candidate);
     }
     if (band.empty()) return 0;

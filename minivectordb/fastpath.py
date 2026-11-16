@@ -27,6 +27,9 @@ except ImportError:  # pragma: no cover - depends on the image
 NUMPY_AVAILABLE = _np is not None
 
 
+_DISABLED = bool(os.environ.get("MINIVECTORDB_DISABLE_NUMPY"))
+
+
 def _disabled() -> bool:
     """Whether the vectorised path was switched off on purpose.
 
@@ -34,15 +37,19 @@ def _disabled() -> bool:
     cannot be installed at build time.  The environment variable makes that
     fallback reproducible on a machine that does have numpy, so the two paths
     can be compared.
+
+    The answer is read once, when the module is imported.  Reading it again
+    on every call cost a lookup in ``os.environ`` -- which encodes the key
+    every time -- and a query asks this question three times.
     """
 
-    return bool(os.environ.get("MINIVECTORDB_DISABLE_NUMPY"))
+    return _DISABLED
 
 
 def available() -> bool:
     """Whether the vectorised path can be used."""
 
-    if _disabled():
+    if _DISABLED:
         return False
     return NUMPY_AVAILABLE
 
@@ -50,7 +57,7 @@ def available() -> bool:
 def module() -> Any:
     """The numpy module, or ``None`` when it is unavailable."""
 
-    if _disabled():
+    if _DISABLED:
         return None
     return _np
 

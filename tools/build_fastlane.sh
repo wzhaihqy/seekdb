@@ -45,8 +45,21 @@ fi
 if command -v x86_64-linux-gnu-g++ >/dev/null 2>&1; then
     build x86_64 x86_64-linux-gnu-g++
 else
-    ZIG="$(dirname "$(dirname "$ROOT")")/venv312/lib/python3.12/site-packages/ziglang/zig"
-    if [ ! -x "$ZIG" ]; then
+    # The zig compiler is searched for rather than assumed: it lives in the
+    # interpreter's site-packages directory, and the path that reaches it
+    # depends on where the workspace is, so a fixed guess goes stale.
+    ZIG=""
+    for candidate in \
+        "$ROOT"/../venv*/lib/python*/site-packages/ziglang/zig \
+        "$ROOT"/../../venv*/lib/python*/site-packages/ziglang/zig \
+        "$ROOT"/../venv*/lib/python*/site-packages/ziglang/zig \
+        "$(command -v zig 2>/dev/null || true)"; do
+        if [ -x "$candidate" ]; then
+            ZIG="$candidate"
+            break
+        fi
+    done
+    if [ -z "$ZIG" ]; then
         echo "no x86_64 compiler and no zig found" >&2
         exit 1
     fi

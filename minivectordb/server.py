@@ -29,7 +29,10 @@ def _write(stream, payload: dict) -> None:
                            "error": {"code": INTERNAL_ERROR,
                                      "message": "response contains a non-finite number"}},
                           ensure_ascii=True, separators=(",", ":"))
-    stream.write(line + "\n")
+    # The bytes are written straight to the binary stream: the text layer
+    # would encode the line again, and a query pays for that on every
+    # request.  ``ensure_ascii`` means the line holds no byte above 0x7f.
+    stream.write(line.encode("ascii") + b"\n")
     stream.flush()
 
 
@@ -42,16 +45,20 @@ def serve(data_dir: str) -> int:
     engine = Engine(data_dir)
     engine.open()
 
-    out = sys.stdout
+    out = sys.stdout.buffer
     _write(out, {"type": "ready"})
 
     stdin = sys.stdin.buffer
     for raw in stdin:
-        line = raw.strip()
-        if not line:
+        # A blank line is not a request.  ``isspace`` answers that without
+        # copying the line, and the copy a strip makes was a copy of the
+        # whole query on every request.
+        if raw.isspace():
             continue
         try:
-            request = json.loads(line.decode("utf-8"))
+            # The parser reads bytes as well as text, and reads them in one
+            # step: the line was decoded into a second string before.
+            request = json.loads(raw)
         except (ValueError, UnicodeError) as exc:
             _log(f"invalid request line: {exc}")
             continue
