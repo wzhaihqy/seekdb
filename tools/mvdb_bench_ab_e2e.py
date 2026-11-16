@@ -26,9 +26,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WS = os.path.dirname(HERE)
 
 
-def run_benchmark(disable_numpy, rows, queries, dim):
-    """Run the benchmark with the vectorised path on or off."""
+def run_benchmark(disable_numpy, rows, queries, dim, data_dir, phase):
+    """Run the benchmark with the vectorised path on or off.
 
+    Every phase gets its own data directory: the store keeps its rows, so
+    a second phase that reuses the first phase's directory would fail on the
+    first primary key.
+    """
+
+    if data_dir:
+        data_dir = os.path.join(data_dir, phase)
     environment = dict(os.environ)
     if disable_numpy:
         environment["MINIVECTORDB_DISABLE_NUMPY"] = "1"
@@ -42,8 +49,8 @@ def run_benchmark(disable_numpy, rows, queries, dim):
         "class A: pass\n"
         "a = A()\n"
         "a.rows = %d; a.dim = %d; a.queries = %d; a.k = 10; a.batch = 100\n"
-        "a.categories = 8; a.seed = 20261112; a.data_dir = ''; a.json = ''\n"
-        "print(json.dumps(mvdb_bench.run(a)))\n" % (HERE, rows, dim, queries),
+        "a.categories = 8; a.seed = 20261112; a.data_dir = %r; a.json = ''\n"
+        "print(json.dumps(mvdb_bench.run(a)))\n" % (HERE, rows, dim, queries, data_dir),
     ]
     finished = subprocess.run(command, capture_output=True, text=True, cwd=WS,
                               env=environment)
@@ -58,12 +65,13 @@ def main(argv=None):
     parser.add_argument("--queries", type=int, default=1000)
     parser.add_argument("--dim", type=int, default=128)
     parser.add_argument("--rounds", type=int, default=2)
+    parser.add_argument("--data-dir", default="")
     args = parser.parse_args(argv)
 
     results = {"generic": [], "vectorised": []}
     for round_number in range(args.rounds):
         for name, disable in (("generic", True), ("vectorised", False)):
-            report = run_benchmark(disable, args.rows, args.queries, args.dim)
+            report = run_benchmark(disable, args.rows, args.queries, args.dim, args.data_dir, name)
             results[name].append(report)
             print("round %d %-10s write %8.3f s   query %9.3f ms/query   "
                   "peak %6.2f MiB   data %7.1f MiB"

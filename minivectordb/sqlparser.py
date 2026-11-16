@@ -786,6 +786,73 @@ _TOPK_RE = re.compile(
     r"[ \t\r\n]*;?[ \t\r\n]*\Z", re.IGNORECASE)
 
 
+#: The TopK statements that repeat, keyed by the text around the vector
+#: literal.  A thousand queries arrive with a thousand different literals
+#: and nothing else different: the same columns, the same table, the same
+#: filter and the same limit.  All of that is said by the template around
+#: the literal, and matching the template with the expression above costs a
+#: scan of the literal -- a thousand numbers the executor reads anyway.
+_TOPK_TEMPLATES: dict[tuple[str, str], dict | None] = {}
+_TOPK_TEMPLATE_LIMIT = 64
+
+#: The marker for "no template", so that a statement the matcher refuses
+#: can be told apart from one that was never seen.
+_NO_TEMPLATE = object()
+
+
+def _topk_bounds(sql: str) -> tuple[int, int] | None:
+    """The bounds of the vector literal, or ``None`` when there is none.
+
+    The expression above cannot match a statement whose literal is not
+    bracketed or holds a backslash, and the literal is the only quoted
+    part that comes before the filter, so the first quote opens it and the
+    second closes it.  Both are found with one pass over the bytes, which
+    is what the matcher does as well -- only it does it a character at a
+    time, with a branch for every one.
+    """
+
+    first = sql.find("'")
+    if first < 0:
+        return None
+    second = sql.find("'", first + 1)
+    if second < 0:
+        return None
+    return first, second
+
+
+def _is_vector_literal(literal: str) -> bool:
+    """Whether the matcher would accept this text as the vector literal."""
+
+    return (len(literal) >= 2 and literal[0] == "[" and literal[-1] == "]"
+            and "\\" not in literal)
+
+
+def _topk_statement(template: dict, literal: str) -> dict:
+    """A fresh statement for a template and a new vector literal.
+
+    Every container the statement holds is built here, so a caller that
+    keeps the statement cannot reach the template through it.
+    """
+
+    items = template["items"]
+    first, second = items
+    expression = second["expr"]
+    arguments = expression[2]
+    return {
+        "kind": "select",
+        "shape": template["shape"],
+        "items": [{"expr": first["expr"], "alias": first["alias"]},
+                  {"expr": (expression[0], expression[1],
+                            [arguments[0], ("str", literal)]),
+                   "alias": second["alias"]}],
+        "table": template["table"],
+        "where": template["where"],
+        "order": list(template["order"]),
+        "limit": template["limit"],
+        "offset": template["offset"],
+    }
+
+
 def fast_topk(sql: str) -> dict | None:
     """The statement dict of a plain TopK query, or ``None``.
 
@@ -795,6 +862,22 @@ def fast_topk(sql: str) -> dict | None:
     ``None`` and the scanner runs.
     """
 
+    bounds = _topk_bounds(sql)
+    if bounds is not None:
+        first, second = bounds
+        key = (sql[:first], sql[second + 1:])
+        template = _TOPK_TEMPLATES.get(key, _NO_TEMPLATE)
+        if template is not _NO_TEMPLATE:
+            literal = sql[first + 1:second]
+            if _is_vector_literal(literal):
+                # The same template with a different literal: the statement
+                # is built again so that nothing the caller does can reach
+                # the template.
+                return None if template is None else \
+                    _topk_statement(template, literal)
+            # The literal is not one the matcher would accept.  The
+            # statement is not a TopK statement then, and the matcher says
+            # so as well; it runs to find out.
     match = _TOPK_RE.fullmatch(sql)
     if match is None:
         return None
@@ -803,7 +886,7 @@ def fast_topk(sql: str) -> dict | None:
     for name in (key, vector, alias, table, order, where_key):
         if name is not None and name.upper() in KEYWORDS:
             return None
-    return {
+    statement = {
         "kind": "select",
         # Everything the statement mentions except the vector literal: the
         # executor resolves the projection, the filter column and the limit
@@ -822,6 +905,22 @@ def fast_topk(sql: str) -> dict | None:
         "limit": int(limit),
         "offset": 0,
     }
+    if bounds is not None:
+        first, second = bounds
+        literal = sql[first + 1:second]
+        if _is_vector_literal(literal) and literal == text:
+            # The template is the statement without its literal, so the
+            # next query with the same template only has to swap the
+            # numbers in.
+            template = dict(statement)
+            template["items"] = [
+                {"expr": ("col", key), "alias": None},
+                {"expr": ("func", "L2_DISTANCE", [("col", vector), None]),
+                 "alias": alias}]
+            if len(_TOPK_TEMPLATES) >= _TOPK_TEMPLATE_LIMIT:
+                _TOPK_TEMPLATES.clear()
+            _TOPK_TEMPLATES[(sql[:first], sql[second + 1:])] = template
+    return statement
 
 
 def scan_select(sql: str) -> dict | None:

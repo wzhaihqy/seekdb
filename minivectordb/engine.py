@@ -47,6 +47,7 @@ from .core import (BIGINT, CONSTRAINT_VIOLATION, DIMENSION_MISMATCH, DUPLICATE_K
 from .sqlparser import parse
 from .store import ColumnarStore, table_directory
 from . import fastpath
+from . import fastlane
 
 _FRAME = struct.Struct("<IQ")
 _LENGTH = struct.Struct("<I")
@@ -1087,10 +1088,16 @@ class Engine:
         argument = node[2][literal_at][1]
         numpy = fastpath.module()
         if literal_is_text:
-            # numpy reads the literal in C; the reference converter walks the
-            # text in Python and is kept for every other shape, so an invalid
-            # literal still ends up on the path that raises.
-            query = fast_float32_text(argument)
+            # The C parser reads the plain decimal shapes the workload
+            # writes and produces exactly the bits the numpy converter
+            # produces; every other shape returns None here and lands on the
+            # numpy converter below, which keeps the values and the errors
+            # it always had.
+            query = None
+            if column_dim is not None:
+                query = fastlane.parse_text(argument, column_dim)
+            if query is None:
+                query = fast_float32_text(argument)
             if query is None:
                 try:
                     query = to_float32_literal(argument)
@@ -1108,6 +1115,7 @@ class Engine:
         slots = scanned[0]
         if slots.size == 0:
             return {"columns": names, "rows": []}
+        kernel_exact = len(scanned) > 2 and scanned[2]
 
         # The distances of the selected rows are recomputed with the reference
         # implementation, so the reported numbers and the tie-break order are
@@ -1120,7 +1128,12 @@ class Engine:
         matrix = None if view is None else view[0]
         keys = store.primary_keys() if view is None else view[2]
         query64 = query32.astype(numpy.float64)
-        if matrix is not None:
+        if matrix is not None and kernel_exact:
+            # The kernel already computed the exact distances and ordered the
+            # candidates by (distance, primary key); nothing is left to do.
+            exact = scanned[1]
+            order = numpy.arange(slots.size)
+        elif matrix is not None:
             # The candidate vectors are taken in one numpy call; asking for one
             # row at a time costs more than the scan itself.  The distance of
             # every candidate is then computed at once.  The accumulation of
@@ -1129,10 +1142,17 @@ class Engine:
             # scan produces (a pairwise ``sum`` does not: it differs in the
             # last bits on most rows).  The differences are squared in place:
             # the buffer that held them is only needed once.
-            vectors = matrix[slots].astype(numpy.float64)
-            numpy.subtract(vectors, query64, out=vectors)
-            numpy.multiply(vectors, vectors, out=vectors)
-            exact = numpy.sqrt(numpy.cumsum(vectors, axis=1)[:, -1])
+            # The exact stage first tries the C routine: it performs the
+            # same widen / subtract / square / accumulate / sqrt walk in the
+            # same order and was verified bit for bit against the numpy
+            # expression below.  When the C object is not available the
+            # numpy expression computes the same numbers itself.
+            exact = fastlane.exact_distances(matrix[slots], query32)
+            if exact is None:
+                vectors = matrix[slots].astype(numpy.float64)
+                numpy.subtract(vectors, query64, out=vectors)
+                numpy.multiply(vectors, vectors, out=vectors)
+                exact = numpy.sqrt(numpy.cumsum(vectors, axis=1)[:, -1])
             order = numpy.lexsort((keys[slots], exact))
         else:
             query_values = query64.tolist()
@@ -1282,10 +1302,10 @@ class Engine:
         total = store.slot_count
         if total == 0:
             return (numpy.empty(0, dtype=numpy.intp),
-                    numpy.empty(0, dtype=numpy.float32))
+                    numpy.empty(0, dtype=numpy.float32), False)
         if int(limit) <= 0:
             return (numpy.empty(0, dtype=numpy.intp),
-                    numpy.empty(0, dtype=numpy.float32))
+                    numpy.empty(0, dtype=numpy.float32), False)
         take = min(int(limit), total)
         if total > self.SCAN_SINGLE_PASS:
             live = store.live_mask()
@@ -1346,7 +1366,7 @@ class Engine:
                 entries[where] = (ids, None, None, None)
         if ids.size == 0:
             return (numpy.empty(0, dtype=numpy.intp),
-                    numpy.empty(0, dtype=numpy.float32))
+                    numpy.empty(0, dtype=numpy.float32), False)
         if ids.size * 3 <= total:
             # A filter that keeps a small part of the table turns the scan into
             # a product over just those rows, and the gather that builds the
@@ -1394,7 +1414,7 @@ class Engine:
         ids = numpy.flatnonzero(store.live_mask())
         if ids.size == 0:
             return (numpy.empty(0, dtype=numpy.intp),
-                    numpy.empty(0, dtype=numpy.float32))
+                    numpy.empty(0, dtype=numpy.float32), False)
         if ids.size * 3 <= total:
             # A filter -- or a delete -- that keeps a small part of the table
             # turns the scan into a read of just those rows.
@@ -1456,8 +1476,63 @@ class Engine:
 
     def _topk(self, numpy: Any, rows: Any, row_norms: Any, slot_ids: Any,
               pks: Any, take: int, query32: Any, row_keys: Any = None):
+        selected = self._kernel_topk(numpy, rows, row_norms, slot_ids, pks,
+                                     take, query32, row_keys)
+        if selected is not None:
+            return selected
         distances = self._distances(numpy, rows, row_norms, query32)
         return self._select(numpy, distances, pks, slot_ids, take, row_keys)
+
+    def _kernel_topk(self, numpy: Any, rows: Any, row_norms: Any,
+                     slot_ids: Any, pks: Any, take: int, query32: Any,
+                     row_keys: Any):
+        """The selection and the exact distances in one call, or ``None``.
+
+        The C++ kernel does what five numpy passes used to do: it adds the
+        norms to the product, finds the boundary, collects the rows that tie
+        with it, computes their exact float64 distances from the stored
+        vectors and orders them by (distance, primary key).  The answer it
+        returns is the answer the generic executor produces -- verified
+        against it over hundreds of random tables -- and it arrives in one
+        call instead of a partition, a comparison, a gather, a distance
+        expression and a lexsort.
+
+        ``None`` means the kernel is not available; the caller then takes
+        the numpy path, which produces the same rows.
+        """
+
+        if fastlane is None or not fastlane.available():
+            return None
+        count = int(rows.shape[0])
+        if count <= 0 or take <= 0:
+            return None
+        buffer = self._distance_buffer
+        if buffer is None or buffer.shape[0] < count:
+            buffer = numpy.empty(max(count, self._scan_width), dtype=numpy.float32)
+            self._distance_buffer = buffer
+            self._scan_width = buffer.shape[0]
+        product = buffer[:count]
+        numpy.dot(rows, query32, out=product)
+        if row_keys is not None:
+            keys = row_keys
+        elif slot_ids is None:
+            keys = pks
+        else:
+            keys = pks[slot_ids]
+        # ``rows`` holds the candidate rows in candidate order, so the row a
+        # candidate reads is the candidate's own position.  ``slot_ids`` is a
+        # different thing: it is the slot of the table the candidate came
+        # from, and it is what the answer reports.  The two are the same
+        # number only when the whole table is scanned; when a filter or a
+        # delete narrowed the table the block was gathered first and the slot
+        # of a candidate is not the row it sits in.  Passing the slots as
+        # the row map made the kernel read rows outside the block.
+        result = fastlane.topk(product, row_norms, rows, query32, keys,
+                               None, slot_ids, take, self.SCAN_TOLERANCE)
+        if result is None:
+            return None
+        slots, distances = result
+        return (slots, distances, True)
 
     def _select(self, numpy: Any, distances: Any, pks: Any, slot_ids: Any, take: int,
                 row_keys: Any = None):
@@ -1513,7 +1588,7 @@ class Engine:
             boundary = float(distances[order[take - 1]])
             if float(distances[order[take]]) - boundary > tolerance:
                 return (nearest if slot_ids is None else slot_ids[nearest],
-                        distances[nearest])
+                        distances[nearest], False)
             candidates = numpy.flatnonzero(distances <= boundary + tolerance)
         elif narrowed is None:
             boundary = float(numpy.partition(distances, take - 1)[take - 1])
@@ -1536,7 +1611,7 @@ class Engine:
             order = numpy.lexsort((keys[candidates], distances[candidates]))
             candidates = candidates[order][:take]
         slots = candidates if slot_ids is None else slot_ids[candidates]
-        return slots, distances[candidates]
+        return slots, distances[candidates], False
 
     def _scan_chunked(self, numpy: Any, store: Any, table: Table,
                       column_position: int, query32: Any, where: Any,
@@ -1609,7 +1684,7 @@ class Engine:
 
         if not candidates:
             return (numpy.empty(0, dtype=numpy.intp),
-                    numpy.empty(0, dtype=numpy.float32))
+                    numpy.empty(0, dtype=numpy.float32), False)
         # The per chunk candidates already contain the rows that can reach the
         # global top k.  The rows that tie with the boundary distance are kept
         # as well, so the reference distances can decide the order the same
@@ -1621,7 +1696,8 @@ class Engine:
         tolerance = max(1e-6, abs(boundary) * 1e-9)
         kept = [item for item in candidates if item[0] <= boundary + tolerance]
         return (numpy.array([item[2] for item in kept], dtype=numpy.intp),
-                numpy.array([item[0] for item in kept], dtype=numpy.float32))
+                numpy.array([item[0] for item in kept], dtype=numpy.float32),
+                False)
 
     def _scan_buffer(self, dim: int):
         """The reusable float64 difference buffer of the vectorised scan."""

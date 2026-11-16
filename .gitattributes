@@ -3,6 +3,7 @@
 * text=auto eol=lf
 
 *.whl binary
+*.so binary
 *.png binary
 *.jpg binary
 *.pdf binary
