@@ -15,6 +15,11 @@ and the server still sees the whole machine in its affinity mask.
 Usage:
     python bench_judge.py [--rows 10000] [--queries 1000] [--cpus 0,1]
                            [--both-pinned] [--data-dir DIR]
+
+By default the server is not pinned: it chooses the fast cores itself, the
+way it will on the judge.  Passing --cpus pins it with taskset, which also
+narrows the set of cores the program may pick from -- so pin it onto fast
+cores, or not at all.
 """
 from __future__ import annotations
 
@@ -94,7 +99,16 @@ def main(argv=None):
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--categories", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20261112)
-    parser.add_argument("--cpus", default="0,1")
+    # Empty by default: the server picks its own cores, and it picks the
+    # fast ones (minivectordb/_pick_cores reads cpu_capacity).  Pinning it
+    # with taskset first narrows the mask the program can choose from, so a
+    # pin onto cores 0 and 1 -- which on a heterogeneous machine are the
+    # slow ones -- measures the small cores and nothing else.  That measured
+    # 0.29 ms/query against 0.10 ms/query for the same code, a factor of
+    # three, all of it the pin and none of it the engine.
+    parser.add_argument("--cpus", default="",
+                        help="taskset mask for the server; empty lets it pick "
+                             "the fast cores itself (the default)")
     parser.add_argument("--both-pinned", action="store_true")
     parser.add_argument("--data-dir", default="")
     parser.add_argument("--tag", default="run")
