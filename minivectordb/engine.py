@@ -535,6 +535,13 @@ class Engine:
             if column.type == VARCHAR:
                 return text
             if column.type == VECTOR:
+                # A quoted vector literal carries the float32 values the
+                # parser packed, so the text does not have to be walked
+                # one number at a time here.  The bytes are the ones
+                # to_float32 would have produced.
+                packed = node[2] if len(node) > 2 else None
+                if packed is not None:
+                    return self._check_vector(column, packed)
                 return self._check_vector(column, to_float32(parse_vector_literal(text)))
             raise SqlError(TYPE_MISMATCH, f"column {column.name} expects BIGINT")
         if tag == "vec":

@@ -19,6 +19,7 @@ pointer for every call costs more than the work the helpers do.
 
 from __future__ import annotations
 
+import array
 import ctypes
 import os
 import platform
@@ -118,6 +119,10 @@ def _library() -> Any:
             lib = ctypes.CDLL(path)
             lib.fl_parse_vector.restype = ctypes.c_int64
             lib.fl_parse_vector.argtypes = [
+                ctypes.c_char_p, ctypes.c_int64,
+                ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int)]
+            lib.fl_parse_vector_any.restype = ctypes.c_int64
+            lib.fl_parse_vector_any.argtypes = [
                 ctypes.c_char_p, ctypes.c_int64,
                 ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int)]
             lib.fl_exact_distances.restype = None
@@ -253,6 +258,37 @@ def parse_text(text: str, dim: int) -> Any:
     if count != dim or not ok.value:
         return None
     return buffer[:dim].copy()
+
+
+def parse_text_any(text: str, capacity: int = 4096) -> Any:
+    """Parse ``[a,b,...]`` into an ``array.array('f')``, or return ``None``.
+
+    The same parse as :func:`parse_text`, but the number of elements is not
+    known in advance: the caller is the SQL parser, which meets a vector
+    literal before it knows which column the literal belongs to.
+
+    ``None`` means the C parser refused the literal, or it held more than
+    ``capacity`` elements.  The caller then falls back to the converter it
+    already had, so the accepted syntax and the reported errors cannot
+    move.  The values are the same float32 bytes the numpy converter
+    produces for the same text.
+    """
+
+    lib = _library()
+    if lib is None or _np is None or capacity is None or capacity <= 0:
+        return None
+    if len(text) < 2 or text[0] != "[":
+        return None
+    buffer, pointer = _parse_slot(capacity)
+    ok = ctypes.c_int(1)
+    count = lib.fl_parse_vector_any(text.encode("utf-8", "replace"),
+                                    int(capacity), pointer,
+                                    ctypes.byref(ok))
+    if count <= 0 or not ok.value:
+        return None
+    out = array.array("f")
+    out.frombytes(buffer[:count].tobytes())
+    return out
 
 
 def topk(coarse: Any, norms: Any, matrix: Any, query: Any, keys: Any,

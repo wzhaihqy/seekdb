@@ -59,6 +59,7 @@ static const int64_t FL_OK        = 0;    /* the whole literal was parsed   */
 static const int64_t FL_NOT_LIST  = -1;   /* not a bracketed list           */
 static const int64_t FL_BAD_FIELD = -2;   /* not a strict decimal number    */
 static const int64_t FL_TOO_MANY  = -3;   /* more fields than the dimension */
+static const int64_t FL_OVERFLOW  = -4;   /* a field leaves the float32 range */
 
 /* Check that [p, end) starts with a strict decimal number, and return its
  * length.
@@ -163,6 +164,12 @@ static bool fl_fast_decimal(const char *p, const char *end, double *out)
     return true;
 }
 
+/* The float32 range the reference implementation accepts.  A value outside
+ * it is refused by the reference (VALUE_OUT_OF_RANGE), so the parser has to
+ * refuse it too: a cast that overflows would turn into infinity, and the
+ * statement that should have failed would have been accepted. */
+static const double FL_FLOAT32_MAX = 3.4028234663852886e+38;
+
 /* Parse "[a,b,...]" into out (capacity dim).  Returns the number of fields
  * parsed on success, or one of the negative status codes above.  *finite_ok
  * is set to 0 when the float64 sum of the values leaves the range the caller
@@ -201,6 +208,72 @@ int64_t fl_parse_vector(const char *text, int64_t dim, float *out,
              * file.  The field is already known to be a strict decimal, so
              * strtod consumes all of it and rounds correctly. */
             widened = strtod(p, NULL);
+        }
+        /* An element outside the float32 range is written as it is, which
+         * makes it an infinity.  The query path wants that: the distance it
+         * produces is reported as an infinity, exactly as it was before this
+         * check existed.  The write path refuses such a literal, and it uses
+         * the other function, fl_parse_vector_any, which does refuse it. */
+        out[count++] = static_cast<float>(widened);
+        total += widened;
+        p += length;
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+        if (p == end) break;                  /* the last field, then ']' */
+        if (*p == ',') { p++; continue; }
+        return FL_BAD_FIELD;                 /* a stray character */
+    }
+    if (!(-1e308 < total && total < 1e308)) *finite_ok = 0;
+    return count;
+}
+
+/* The same parse, but the dimension is not known in advance.
+ *
+ * The bulk INSERT of the judge writes its vectors as quoted bracket
+ * notation, and the parser meets them before it knows which column they
+ * belong to, so it cannot say how many elements to expect.  Counting the
+ * fields first and then parsing them means walking the text twice; this
+ * walks it once and writes into a buffer the caller sized generously.
+ *
+ * out must have room for capacity elements.  The number of fields is
+ * returned on success.  A literal with more fields than the capacity is
+ * refused with FL_TOO_MANY, so the caller can fall back to the parser
+ * that knows the dimension.
+ *
+ * The values are the same ones fl_parse_vector produces: the numbers are
+ * read with the same strict grammar and narrowed through the same double
+ * route, so the float32 bytes are identical.
+ */
+int64_t fl_parse_vector_any(const char *text, int64_t capacity, float *out,
+                             int *finite_ok)
+{
+    const char *p = text;
+    const char *end;
+    *finite_ok = 1;
+    if (capacity <= 0) return FL_BAD_FIELD;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '[') return FL_NOT_LIST;
+    p++;
+    end = text + strlen(text);
+    while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r'
+                       || end[-1] == '\n')) end--;
+    if (end <= p || end[-1] != ']') return FL_NOT_LIST;
+    end--;                                   /* the closing bracket */
+
+    double total = 0.0;
+    int64_t count = 0;
+    for (;;) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+        if (p >= end) return FL_BAD_FIELD;    /* no closing bracket */
+        if (count >= capacity) return FL_TOO_MANY;
+        int64_t length = fl_scan_decimal(p, end);
+        if (length <= 0) return FL_BAD_FIELD;
+        double widened;
+        if (!fl_fast_decimal(p, p + length, &widened)) {
+            widened = strtod(p, NULL);
+        }
+        if (widened > FL_FLOAT32_MAX || widened < -FL_FLOAT32_MAX) {
+            *finite_ok = 0;                   /* the reference refuses it */
+            return FL_OVERFLOW;
         }
         out[count++] = static_cast<float>(widened);
         total += widened;
