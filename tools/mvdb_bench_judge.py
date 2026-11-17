@@ -15,11 +15,24 @@ and the server still sees the whole machine in its affinity mask.
 Usage:
     python bench_judge.py [--rows 10000] [--queries 1000] [--cpus 0,1]
                            [--both-pinned] [--data-dir DIR]
+                           [--platform-k 3.15] [--selftest]
 
 By default the server is not pinned: it chooses the fast cores itself, the
 way it will on the judge.  Passing --cpus pins it with taskset, which also
 narrows the set of cores the program may pick from -- so pin it onto fast
 cores, or not at all.
+
+The run prints three numbers and they are not interchangeable:
+
+    E local     what the formula yields with this machine's query latency.
+                Optimistic by exactly the factor k, because the judge only
+                has two CPUs and this workstation may open a BLAS worker
+                per visible core.
+    E platform  what the judge prints, once the query latency is scaled by
+                k.  This is the number to compare against a platform run.
+    E=5000      the local query latency that would be needed to reach a
+                platform score of 5000.  Printed next to the protocol floor
+                so the gap is visible instead of implied.
 """
 from __future__ import annotations
 
@@ -36,6 +49,98 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WS = os.path.dirname(HERE)
 MAIN = os.path.join(WS, "main.py")
 PYTHON = sys.executable
+
+# ---------------------------------------------------------------------------
+# Score arithmetic, as pure functions so it can be unit tested.
+#
+# The platform computes E = (3.67 / w + 2 * 664.335 / q_plat) / 3, where
+# q_plat is the query latency *measured on the judge*, not on this machine.
+# The judge runs the container with --cpus=2, so its q is slower than the
+# q of a workstation that may open a BLAS worker per visible core.
+#
+# The ratio between the two is a property of the hardware, not of the code.
+# It was calibrated on two independent platform observations of two
+# different commits (see docs/性能标准与判定阈值.md section 2.2):
+#
+#     986ff36d3: platform 1871.704677, q_local ~ 0.0743 ms
+#                 -> q_plat ~ 0.2369 ms, k ~ 3.19
+#     02fedb9cf: platform 1477.2,     q_local ~ 0.0961 ms
+#                 -> q_plat ~ 0.3002 ms, k ~ 3.12
+#
+# The write term is left uncalibrated on purpose: it is three orders of
+# magnitude smaller than the query term (3.67/w ~ 5.7 against
+# 2*664.335/q_plat ~ 5600), so the local write time moves the score by
+# less than 0.1 and no separate platform write measurement is needed.
+# ---------------------------------------------------------------------------
+
+BASELINE_QUERY_MS = 664.335
+BASELINE_WRITE_S = 3.67
+DEFAULT_PLATFORM_K = 3.15
+
+
+def local_score(write_seconds, per_query_ms):
+    """E as the formula reads when q is this machine's q.
+
+    Optimistic by exactly the factor k on the query term: this is NOT the
+    number the platform prints.
+    """
+    return (BASELINE_WRITE_S / max(write_seconds, 1e-9)
+            + 2 * BASELINE_QUERY_MS / max(per_query_ms, 1e-9)) / 3.0
+
+
+def platform_score(write_seconds, per_query_ms, k):
+    """E as the platform would print it, given the calibration ratio k.
+
+    q_plat = k * q_local; the write term stays local because it is
+    negligible (see the comment above).
+    """
+    q_plat = max(per_query_ms, 1e-9) * k
+    return (BASELINE_WRITE_S / max(write_seconds, 1e-9)
+            + 2 * BASELINE_QUERY_MS / q_plat) / 3.0
+
+
+def query_ms_for_score(target, write_seconds, k):
+    """The local query latency that would reach E = target on the platform.
+
+    Returns None when the target is unreachable even at q = 0, i.e. when
+    the write term alone already exceeds it.
+    """
+    residual = 3 * target - BASELINE_WRITE_S / max(write_seconds, 1e-9)
+    if residual <= 0:
+        return None
+    q_plat = 2 * BASELINE_QUERY_MS / residual
+    return q_plat / k
+
+
+def _selftest():
+    """Check the score functions against the two known platform points.
+
+    The tolerance is relative because the write term on the judge was never
+    measured separately: it is carried over from this machine.  The query
+    term is three orders of magnitude larger, so the write term moves the
+    score by well under one point, and 0.5% is the honest bound.
+    """
+    def close(got, want):
+        assert abs(got - want) / want < 0.005, (got, want)
+
+    # 986ff36d3: local q 0.0743 ms, local w 0.644 s -> platform 1871.70
+    close(platform_score(0.644, 0.0743, 3.19), 1871.704677)
+    # 02fedb9cf: local q 0.0961 ms, local w 0.644 s -> platform 1477.2
+    close(platform_score(0.644, 0.0961, 3.12), 1477.2)
+    # The local score is strictly the optimistic one.
+    assert local_score(0.644, 0.0743) > platform_score(0.644, 0.0743, 3.19)
+    # Inverting the platform score reproduces the input latency.
+    target = platform_score(0.644, 0.0761, 3.15)
+    back = query_ms_for_score(target, 0.644, 3.15)
+    assert abs(back - 0.0761) < 1e-6, back
+    # A target the write term already covers has no solution: with w = 1 s
+    # the write term contributes 3.67 to the numerator, which already
+    # exceeds 3 * 1.0, so no query latency can reach E = 1.
+    assert query_ms_for_score(1.0, 1.0, 3.15) is None
+    # A larger k means a slower judge, so a lower platform score.
+    assert (platform_score(0.644, 0.0761, 3.15)
+            > platform_score(0.644, 0.0761, 3.50))
+    return True
 
 
 def vector_literal(values):
@@ -112,7 +217,18 @@ def main(argv=None):
     parser.add_argument("--both-pinned", action="store_true")
     parser.add_argument("--data-dir", default="")
     parser.add_argument("--tag", default="run")
+    parser.add_argument("--platform-k", type=float, default=DEFAULT_PLATFORM_K,
+                        help="calibration ratio between the judge's query "
+                             "latency and this machine's (see the module "
+                             "comment; default %.2f)" % DEFAULT_PLATFORM_K)
+    parser.add_argument("--selftest", action="store_true",
+                        help="run the score arithmetic checks and exit")
     args = parser.parse_args(argv)
+
+    if args.selftest:
+        _selftest()
+        print("score arithmetic selftest: PASS")
+        return 0
 
     root = args.data_dir or os.path.join(
         "/home/wzh_linux/WorkBuddy/2026-11-14-06-20-42/tmp/judge", args.tag)
@@ -182,12 +298,27 @@ def main(argv=None):
         floor = (time.perf_counter() - floor_start) / len(statements) * 1000.0
 
         # The score formula of the task: E = (3.67/w + 2 * 664.335/q) / 3,
-        # with q in milliseconds.
-        score = (3.67 / max(write_seconds, 1e-9) + 2 * 664.335 / per_query) / 3.0
+        # with q in milliseconds.  Two numbers come out of it and they must
+        # not be confused: the local one uses this machine's q, the platform
+        # one uses the judge's q, which is k times slower.
+        e_local = local_score(write_seconds, per_query)
+        e_platform = platform_score(write_seconds, per_query, args.platform_k)
+        need_5000 = query_ms_for_score(5000.0, write_seconds, args.platform_k)
         print("server cpus=%s  client cpus=%s" % (server_cpus, client_cpus or "all"))
         print("write %.3f s   query %.4f ms/query   protocol floor %.4f ms   "
-              "engine %.4f ms   E estimate %.0f"
-              % (write_seconds, per_query, floor, per_query - floor, score))
+              "engine %.4f ms"
+              % (write_seconds, per_query, floor, per_query - floor))
+        print("  E local    %.0f   (this machine's q; optimistic by k)"
+              % e_local)
+        print("  E platform %.0f   (q_plat = %.4f ms = k %.2f x %.4f ms; "
+              "the number the judge prints)"
+              % (e_platform, per_query * args.platform_k, args.platform_k, per_query))
+        if need_5000 is None:
+            print("  E=5000     unreachable: the write term alone already exceeds it")
+        else:
+            print("  E=5000     needs query %.4f ms/query on this machine "
+                  "(protocol floor here is %.4f ms)"
+                  % (need_5000, floor))
     finally:
         try:
             db.shutdown()
