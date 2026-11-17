@@ -32,12 +32,42 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# numpy 2.2.3 的 cp312 manylinux_2_17_x86_64 轮子（16 MB）。
+# numpy 2.2.3 的 cp312 manylinux_2_17 轮子（x86_64 与 aarch64 各一份）。
 # --only-binary=:all: 保证 pip 不会退化成源码编译（镜像里没有编译器，源码编译必然失败）。
+#
+# 轮子按构建架构挑选，不能把两个都交给 pip：
+# pip 遇到任何一个与当前平台不兼容的轮子就整体报错退出（"is not a supported wheel
+# on this platform"），于是**装得上本架构轮子这件事也被另一个架构的轮子连累**，
+# 整条命令失败后只剩纯标准库兜底，查询从 ~5 ms 退化成 ~1250 ms。
+# 按 dpkg 的架构名选文件，两种架构的构建各自只会看到自己那份。
+#
+# 这一层**绝不失败**：装不上 numpy 只会让程序退回纯标准库路径，功能仍然正确，
+# 只是性能分低。构建本身必须成功——镜像构建失败等于这一版直接拿 0 分，
+# 那比"性能分低"坏得多。所以这里不用 set -e，每一级失败都只是继续往下走。
 COPY vendor /app/vendor
-RUN pip install --no-cache-dir --disable-pip-version-check --only-binary=:all: /app/vendor/*.whl \
-    || pip install --no-cache-dir --disable-pip-version-check --only-binary=:all: "numpy==2.2.3" \
-    || echo "numpy unavailable, falling back to the pure standard library path"
+RUN arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64)  pattern='*x86_64.whl' ;; \
+      arm64)  pattern='*aarch64.whl' ;; \
+      *)      pattern='' ;; \
+    esac; \
+    wheel=''; \
+    if [ -n "$pattern" ]; then \
+      wheel="$(ls /app/vendor/$pattern 2>/dev/null | head -n 1 || true)"; \
+    fi; \
+    if [ -n "$wheel" ]; then \
+      echo "installing the vendored numpy wheel for $arch: $wheel"; \
+      pip install --no-cache-dir --disable-pip-version-check --only-binary=:all: "$wheel" \
+        || echo "the vendored wheel did not install, trying the network"; \
+    else \
+      echo "no numpy wheel for $arch, trying the network"; \
+    fi; \
+    if ! python3 -c "import numpy" >/dev/null 2>&1; then \
+      pip install --no-cache-dir --disable-pip-version-check --only-binary=:all: "numpy==2.2.3" \
+        || echo "numpy unavailable, falling back to the pure standard library path"; \
+    fi; \
+    python3 -c "import numpy; print('numpy', numpy.__version__, 'is available')" \
+      || echo "numpy is NOT available: the pure standard library path will be used"
 
 COPY main.py /app/main.py
 COPY minivectordb /app/minivectordb
