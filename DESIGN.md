@@ -788,3 +788,70 @@ off      0.0751    0.0773
 它会挑 [15, 19] 两个大核。
 
 完整命令、判定阈值表、以及平台门槛的反解，都在 `docs/性能标准与判定阈值.md`。
+
+---
+
+## 15. 第九轮：镜像里的 numpy 是性能分的前提，而 pip 会因为一个轮子把另一个也毙掉
+
+### 15.1 一条静默的失效路径
+
+查询项占性能分的 2/3，而查询项的速度**完全依赖 numpy**：没有 numpy，
+`fastpath.available()` 返回 False，整个 TopK 退回通用执行器（逐行解码 + 逐行算距离），
+一次查询从 ~0.26 ms 变成 ~1250 ms —— 1000 次查询要 20 分钟，超时且拿不到性能分。
+
+Dockerfile 原本这样装 numpy：
+
+```dockerfile
+COPY vendor /app/vendor
+RUN pip install --no-cache-dir --only-binary=:all: /app/vendor/*.whl \
+    || pip install --no-cache-dir --only-binary=:all: "numpy==2.2.3" \
+    || echo "numpy unavailable, falling back to the pure standard library path"
+```
+
+`vendor/` 里原本只有 x86_64 一个轮子，所以这一行碰巧能过。但它依赖的是「只有一个所以不冲突」，
+而不是「选对了所以能装」。实测 pip 的行为是**整体否决**：
+
+```
+Processing ./vendor/numpy-2.2.3-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+ERROR: numpy-2.2.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+       is not a supported wheel on this platform.
+-> numpy unavailable, falling back to the pure standard library path
+```
+
+只要 vendor 里有**任何**一个与构建架构不符的轮子，pip 就整体退出，
+连本来装得上的那一个也一起赔进去。而架构有两个：`fastlane` 的 `.so` 是 aarch64 与 x86_64 各一份，
+numpy 的轮子也应当各一份。
+
+### 15.2 改成按架构挑轮子
+
+```dockerfile
+RUN arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64)  pattern='*x86_64.whl' ;; \
+      arm64)  pattern='*aarch64.whl' ;; \
+      *)      pattern='' ;; \
+    esac; \
+    wheel="$(ls /app/vendor/$pattern 2>/dev/null | head -n 1 || true)"; \
+    [ -n "$wheel" ] && pip install --no-cache-dir --only-binary=:all: "$wheel" || true; \
+    python3 -c "import numpy" || pip install --only-binary=:all: "numpy==2.2.3" || \
+      echo "numpy unavailable, falling back to the pure standard library path"
+```
+
+### 15.3 这一层绝不能让构建失败
+
+上面刻意**不用 `set -e`**。原因是两类失败的代价完全不对等：
+
+| 失败 | 后果 |
+|---|---|
+| numpy 没装上 | 退回纯标准库路径，功能仍然正确，性能分低 |
+| 镜像构建失败 | 这一版直接拿 0 分 |
+
+所以每一级兜底失败都只继续往下走，最后打印实际状态（`numpy ... is available`
+或 `numpy is NOT available`），让构建日志能自证走的是哪条路。
+
+### 15.4 判断判题机是哪个架构
+
+不需要猜：`vendor/` 里只有 x86_64 轮子时，若判题机是 arm64，
+平台分数会是 `E(0.615, 1250) ≈ 2.34`；实测是 2009.43，与 `E(0.615, 0.2206) ≈ 2009.65` 吻合。
+**平台那 2009 分本身就是「判题机上 numpy 装上了」的证明。** 两个架构的轮子都随仓库提交，
+之后无论判题机换不换架构都不会再掉进这条静默路径。
