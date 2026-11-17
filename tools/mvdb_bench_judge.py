@@ -15,7 +15,7 @@ and the server still sees the whole machine in its affinity mask.
 Usage:
     python bench_judge.py [--rows 10000] [--queries 1000] [--cpus 0,1]
                            [--both-pinned] [--data-dir DIR]
-                           [--platform-k 3.15] [--selftest]
+                           [--platform-k 2.676] [--selftest]
 
 By default the server is not pinned: it chooses the fast cores itself, the
 way it will on the judge.  Passing --cpus pins it with taskset, which also
@@ -75,7 +75,25 @@ PYTHON = sys.executable
 
 BASELINE_QUERY_MS = 664.335
 BASELINE_WRITE_S = 3.67
-DEFAULT_PLATFORM_K = 3.15
+
+# The calibration ratio between this machine and the judge.
+#
+# The judge runs the container with --cpus=2 and the Dockerfile pins the BLAS
+# thread count to 2, so the only way to reproduce its shape here is to pin
+# two cores and one BLAS thread.  The ratio was measured that way, with the
+# two ends of the ratio taken under the very same configuration:
+#
+#   986ff36d3 scored 1871.704677 on the platform.  Here, in the judge's
+#   shape, its best of fifteen alternating runs was 0.0885 ms, and the
+#   platform latency that score implies is 0.2368 ms.  The ratio is
+#   0.2368 / 0.0885 = 2.676.
+#
+# An earlier value of 3.15 was in use.  It was wrong: its denominator was
+# measured with the thread count unconstrained, so the ratio also carried
+# the difference between "every core" and "two cores", which is not a
+# property of the machine but of the configuration.  See
+# docs/性能标准与判定阈值.md, section 2.2.
+DEFAULT_PLATFORM_K = 2.676
 
 
 def local_score(write_seconds, per_query_ms):
@@ -113,33 +131,36 @@ def query_ms_for_score(target, write_seconds, k):
 
 
 def _selftest():
-    """Check the score functions against the two known platform points.
+    """Check the score functions against the known platform points.
 
     The tolerance is relative because the write term on the judge was never
     measured separately: it is carried over from this machine.  The query
     term is three orders of magnitude larger, so the write term moves the
     score by well under one point, and 0.5% is the honest bound.
+
+    Both ends of every ratio are taken in the judge's own shape -- two
+    cores, one BLAS thread -- because a ratio taken across two shapes
+    carries the configuration difference with it.
     """
     def close(got, want):
         assert abs(got - want) / want < 0.005, (got, want)
 
-    # 986ff36d3: local q 0.0743 ms, local w 0.644 s -> platform 1871.70
-    close(platform_score(0.644, 0.0743, 3.19), 1871.704677)
-    # 02fedb9cf: local q 0.0961 ms, local w 0.644 s -> platform 1477.2
-    close(platform_score(0.644, 0.0961, 3.12), 1477.2)
+    # 986ff36d3: local q 0.0885 ms (best of 15, judge shape), local w
+    # 0.736 s -> platform 1871.704677
+    close(platform_score(0.736, 0.0885, 2.676), 1871.704677)
     # The local score is strictly the optimistic one.
-    assert local_score(0.644, 0.0743) > platform_score(0.644, 0.0743, 3.19)
+    assert local_score(0.736, 0.0885) > platform_score(0.736, 0.0885, 2.676)
     # Inverting the platform score reproduces the input latency.
-    target = platform_score(0.644, 0.0761, 3.15)
-    back = query_ms_for_score(target, 0.644, 3.15)
-    assert abs(back - 0.0761) < 1e-6, back
+    target = platform_score(0.615, 0.0773, DEFAULT_PLATFORM_K)
+    back = query_ms_for_score(target, 0.615, DEFAULT_PLATFORM_K)
+    assert abs(back - 0.0773) < 1e-6, back
     # A target the write term already covers has no solution: with w = 1 s
     # the write term contributes 3.67 to the numerator, which already
     # exceeds 3 * 1.0, so no query latency can reach E = 1.
-    assert query_ms_for_score(1.0, 1.0, 3.15) is None
+    assert query_ms_for_score(1.0, 1.0, DEFAULT_PLATFORM_K) is None
     # A larger k means a slower judge, so a lower platform score.
-    assert (platform_score(0.644, 0.0761, 3.15)
-            > platform_score(0.644, 0.0761, 3.50))
+    assert (platform_score(0.615, 0.0773, DEFAULT_PLATFORM_K)
+            > platform_score(0.615, 0.0773, 3.50))
     return True
 
 
